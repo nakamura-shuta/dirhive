@@ -6,16 +6,18 @@ description = "P2P directory sync daemon + MCP server"
 license = "MIT"
 
 # ------------------------------------------------------------------------
-# Iroh 系 crate のバージョン対応表 (= design.md §12 Q7 で固定):
+# Iroh 系 crate のバージョン対応表 (2026-05-14 時点で 1.0 rc が出揃ったので
+# Phase 1 段階から rc.0 を採用):
 #
-#   iroh         = 0.98.1
-#   iroh-base    = 0.98.0
-#   iroh-gossip  = 0.98.0   (iroh ^0.98 を要求)
-#   iroh-tickets = 0.5.0    (iroh-base ^0.98 を要求)
-#   iroh-blobs   = 0.100.0  (iroh ^0.98 を要求) ← 番号だけ 0.100 だが 0.98 系と組む
+#   iroh         = 1.0.0-rc.0   (2026-05-07 release)
+#   iroh-base    = 1.0.0-rc.0   (2026-05-07 release)
+#   iroh-tickets = 1.0.0-rc.0   (2026-05-08 release)
+#   iroh-blobs   = 0.101.0      (2026-05-08 release、内部で iroh 1.0.0-rc.0 を要求)
+#   iroh-gossip  = 0.99.0       (2026-05-08 release、内部で iroh 1.0.0-rc.0 を要求)
 #
-# Phase 1B (refactor、旧 iroh-wiki-sync 経験) で iroh-docs 依存は削除済。
-# 本 project は gossip + blobs 構成のみ。
+# iroh-blobs / iroh-gossip だけ 1.0 rc 番号でないが、これらは iroh 本体の 1.0 rc
+# と互換性ある version で release されている (= 番号は揃わないが組み合わせは OK)。
+# 後で 1.0 final が出たら全 crate を 1.0.x に揃える upgrade を行う想定。
 # ------------------------------------------------------------------------
 
 [dependencies]
@@ -24,11 +26,11 @@ base64 = "0.22"
 blake3 = "1.8.4"
 clap = { version = "4.6.1", features = ["derive"] }
 futures-lite = "2.6"
-iroh = "0.98.1"
-iroh-base = "0.98.0"
-iroh-blobs = "0.100.0"
-iroh-gossip = "0.98.0"
-iroh-tickets = "0.5.0"
+iroh = "1.0.0-rc.0"
+iroh-base = "1.0.0-rc.0"
+iroh-blobs = "0.101.0"
+iroh-gossip = "0.99.0"
+iroh-tickets = "1.0.0-rc.0"
 notify = "8.2.0"
 notify-debouncer-full = "0.7"
 # MCP server framework (= bin/p2p-sync-mcp.rs)
