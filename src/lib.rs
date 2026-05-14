@@ -78,7 +78,11 @@ pub struct HealthInfo {
     pub dynamic_info: Option<HealthInfoDynamic>,
 }
 
-/// 健全性チェック。Phase 1 では skeleton のみ、Phase 2-3 で実装する。
-pub fn run_health_check() -> Result<HealthInfo> {
+/// 健全性チェック。`daemon_state` ありなら `HealthInfoDynamic` も埋める。
+///
+/// Phase 1 では skeleton のみ、Phase 2-3 で実装する。
+pub fn run_health_check(
+    _daemon_state: Option<&daemon::state::DaemonState>,
+) -> Result<HealthInfo> {
     anyhow::bail!("not implemented (Phase 2-3 で実装予定)")
 }

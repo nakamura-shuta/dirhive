@@ -341,7 +341,7 @@ MVP で作らないもの:
 - better conflict report
 - QR / URL scheme invite
 - invite TTL / 署名
-- iroh 1.0 upgrade
+- iroh 1.0 final 追従 (= 既に rc.0 を採用済、final release 後に全 crate を 1.0.x に揃える)
 - Linux systemd support
 - Windows Service support
 
