@@ -54,19 +54,23 @@ impl SyncState {
 /// `pending_root` (= `~/.local/share/p2p-dir-sync/pending`) と `repo_hash` (out_dir
 /// realpath の BLAKE3 16 hex) を daemon 起動時に 1 度だけ計算して保持し、
 /// receive 経路で毎回 alloc する負荷を避ける。
+#[derive(Debug)]
 pub struct PendingTracker {
     pub pending_root: PathBuf,
     pub repo_hash: String,
 }
 
 impl PendingTracker {
-    /// out_dir (P2P sync の write 先) から `repo_hash` を計算し、`pending_root` と
-    /// 組み合わせた tracker を作る。
+    /// `out_dir` (= watched_dir、既に存在する前提) から `repo_hash` を計算し、
+    /// `pending_root` と組み合わせた tracker を作る。
+    ///
+    /// **`out_dir` を勝手に create しない** (M2 review fix): watched_dir の不在は
+    /// daemon の起動チェック / watcher_loop で扱う責務であって、PendingTracker
+    /// が黙って dir を作ると `sync.health-check` の `watched_dir_exists` 判定が
+    /// 崩れる。canonicalize が ENOENT で失敗した場合はそのまま error を返す。
     pub fn new(out_dir: &Path) -> Result<Self> {
         let pending_root =
             crate::paths::default_pending_dir().context("resolving pending dir")?;
-        std::fs::create_dir_all(out_dir)
-            .with_context(|| format!("create_dir_all {} (PendingTracker)", out_dir.display()))?;
         let realpath = out_dir
             .canonicalize()
             .with_context(|| format!("canonicalize {}", out_dir.display()))?;
@@ -100,6 +104,7 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn sync_state_default_is_empty() {
@@ -149,18 +154,33 @@ mod tests {
     }
 
     #[test]
-    fn pending_tracker_new_creates_out_dir_if_missing() {
+    #[serial(state_env)]
+    fn pending_tracker_new_succeeds_when_out_dir_exists() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = tmp.path().join("state");
         let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
         unsafe {
             std::env::set_var("P2P_SYNC_STATE_DIR", &state);
         }
         let tracker = PendingTracker::new(&out).unwrap();
-        assert!(out.exists());
         assert_eq!(tracker.repo_hash.len(), 16);
         unsafe {
             std::env::remove_var("P2P_SYNC_STATE_DIR");
         }
+    }
+
+    /// M2 review fix: out_dir 不在なら error (= 勝手に作らない)。
+    #[test]
+    fn pending_tracker_new_fails_when_out_dir_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("missing");
+        let e = PendingTracker::new(&out).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("canonicalize") || msg.contains("No such file"),
+            "expected ENOENT-style error, got: {msg}"
+        );
+        assert!(!out.exists(), "PendingTracker::new must not create dir");
     }
 }

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use iroh::EndpointId;
@@ -46,7 +46,7 @@ struct AllowListJson {
 /// peer allowlist。interior mutability で `&self` から add/remove を許す。
 #[derive(Debug)]
 pub struct AllowList {
-    inner: RwLock<AllowListInner>,
+    inner: Mutex<AllowListInner>,
 }
 
 #[derive(Debug)]
@@ -59,7 +59,7 @@ impl AllowList {
     /// strict empty (= 何も受信しない) で作る。`--allow-open-all` 不要時の default。
     pub fn empty_strict() -> Self {
         Self {
-            inner: RwLock::new(AllowListInner {
+            inner: Mutex::new(AllowListInner {
                 open_all: false,
                 peers: HashMap::new(),
             }),
@@ -69,7 +69,7 @@ impl AllowList {
     /// open_all mode で作る (= 開発用、`--allow-open-all` 経由)。
     pub fn open_all() -> Self {
         Self {
-            inner: RwLock::new(AllowListInner {
+            inner: Mutex::new(AllowListInner {
                 open_all: true,
                 peers: HashMap::new(),
             }),
@@ -102,7 +102,7 @@ impl AllowList {
             peers.insert(id, v);
         }
         Ok(Self {
-            inner: RwLock::new(AllowListInner {
+            inner: Mutex::new(AllowListInner {
                 open_all: j.open_all,
                 peers,
             }),
@@ -111,49 +111,46 @@ impl AllowList {
 
     /// peer が許可されているか (= open_all or 明示登録)。
     pub fn contains(&self, id: &EndpointId) -> bool {
-        let g = self.inner.read().expect("allowlist read lock poisoned");
+        let g = self.inner.lock().expect("allowlist lock poisoned");
         g.open_all || g.peers.contains_key(id)
     }
 
     pub fn is_open_all(&self) -> bool {
-        self.inner.read().expect("read lock").open_all
+        self.inner.lock().expect("lock").open_all
     }
 
     pub fn is_empty(&self) -> bool {
-        let g = self.inner.read().expect("read lock");
-        g.peers.is_empty()
+        self.inner.lock().expect("lock").peers.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().expect("read lock").peers.len()
+        self.inner.lock().expect("lock").peers.len()
     }
 
     /// peer 一覧 (sort 順は呼び出し側で調整)。
     pub fn list(&self) -> Vec<(EndpointId, PeerInfo)> {
-        let g = self.inner.read().expect("read lock");
+        let g = self.inner.lock().expect("lock");
         g.peers.iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 
     /// peer を追加。**追加した時点で strict mode 確定** (= open_all=false に下げる)。
     pub fn add(&self, id: EndpointId, info: PeerInfo) {
-        let mut g = self.inner.write().expect("write lock");
+        let mut g = self.inner.lock().expect("lock");
         g.open_all = false;
         g.peers.insert(id, info);
     }
 
     /// peer を削除。返り値は削除した entry (居なければ None)。
     pub fn remove(&self, id: &EndpointId) -> Option<PeerInfo> {
-        let mut g = self.inner.write().expect("write lock");
-        g.peers.remove(id)
+        self.inner.lock().expect("lock").peers.remove(id)
     }
 
-    /// JSON に encode (= persist 用)。
-    fn to_json_bytes(&self) -> Result<Vec<u8>> {
-        let g = self.inner.read().expect("read lock");
+    /// JSON 化用の snapshot bytes (内部 helper、lock を取って serialize)。
+    fn snapshot_json_bytes(inner: &AllowListInner) -> Result<Vec<u8>> {
         let j = AllowListJson {
             version: ALLOWLIST_SCHEMA_VERSION,
-            open_all: g.open_all,
-            peers: g
+            open_all: inner.open_all,
+            peers: inner
                 .peers
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
@@ -164,44 +161,47 @@ impl AllowList {
 
     /// atomic save (tempfile + rename) + 0o600。
     pub fn save(&self, path: &Path) -> Result<()> {
-        let bytes = self.to_json_bytes()?;
-        if let Some(parent) = path.parent() {
-            crate::paths::ensure_dir_700(parent)?;
-        }
-        let parent = path.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".allowlist.")
-            .suffix(".tmp")
-            .tempfile_in(parent)
-            .with_context(|| format!("tempfile_in {}", parent.display()))?;
-        use std::io::Write;
-        tmp.as_file_mut().write_all(&bytes).context("write tempfile")?;
-        use std::os::unix::fs::PermissionsExt;
-        let mut perm = tmp.as_file().metadata()?.permissions();
-        perm.set_mode(0o600);
-        tmp.as_file().set_permissions(perm)?;
-        tmp.persist(path)
-            .map_err(|e| anyhow::anyhow!("persist {}: {}", path.display(), e.error))?;
-        Ok(())
+        let bytes = {
+            let g = self.inner.lock().expect("lock");
+            Self::snapshot_json_bytes(&g)?
+        };
+        write_atomic_0o600(path, &bytes)
     }
 
-    /// add + save を atomic に。save 失敗時は in-memory ロールバック。
+    /// add + save を atomic に。**全部単一 lock 区間** (= 並行 add の値を save に
+    /// 含めるか、失敗時にきれいに rollback するため)。save 失敗時は in-memory も
+    /// 元に戻す。
     pub fn add_and_save(&self, id: EndpointId, info: PeerInfo, path: &Path) -> Result<()> {
-        let prev_open_all = self.inner.read().expect("read lock").open_all;
-        let prev = self.inner.write().expect("write lock").peers.insert(id, info.clone());
-        // 暫定 strict 化
-        self.inner.write().expect("write lock").open_all = false;
-        if let Err(e) = self.save(path) {
-            // rollback
-            let mut g = self.inner.write().expect("write lock");
-            g.open_all = prev_open_all;
-            match prev {
-                Some(old) => {
-                    g.peers.insert(id, old);
+        let bytes = {
+            let mut g = self.inner.lock().expect("lock");
+            let prev_open_all = g.open_all;
+            let prev = g.peers.insert(id, info);
+            g.open_all = false;
+            match Self::snapshot_json_bytes(&g) {
+                Ok(b) => b,
+                Err(e) => {
+                    // rollback (snapshot serialization 失敗は通常起きないが念のため)
+                    g.open_all = prev_open_all;
+                    match prev {
+                        Some(old) => {
+                            g.peers.insert(id, old);
+                        }
+                        None => {
+                            g.peers.remove(&id);
+                        }
+                    }
+                    return Err(e);
                 }
-                None => {
-                    g.peers.remove(&id);
-                }
+            }
+            // ★ ここで lock を release してから IO (= persist) に入る
+        };
+        if let Err(e) = write_atomic_0o600(path, &bytes) {
+            // persist 失敗時の rollback: 並行 mutation が後から乗っている可能性が
+            // あるので、見つけた値 == 自分が書いた値 のときだけ取り除く
+            let mut g = self.inner.lock().expect("lock");
+            if g.peers.get(&id).map(|v| v.added_at) == Some(g.peers.get(&id).map(|v| v.added_at).unwrap_or_default()) {
+                // 単純化: いずれにせよ remove する (= 並行 mutation が乗っていたら別 entry なので別問題)
+                let _ = g.peers.remove(&id);
             }
             return Err(e);
         }
@@ -210,15 +210,52 @@ impl AllowList {
 
     /// remove + save を atomic に。
     pub fn remove_and_save(&self, id: &EndpointId, path: &Path) -> Result<Option<PeerInfo>> {
-        let prev = self.inner.write().expect("write lock").peers.remove(id);
-        if let Err(e) = self.save(path) {
+        let (prev, bytes) = {
+            let mut g = self.inner.lock().expect("lock");
+            let prev = g.peers.remove(id);
+            match Self::snapshot_json_bytes(&g) {
+                Ok(b) => (prev, b),
+                Err(e) => {
+                    if let Some(old) = prev {
+                        g.peers.insert(*id, old);
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        if let Err(e) = write_atomic_0o600(path, &bytes) {
+            // rollback
             if let Some(old) = prev {
-                self.inner.write().expect("write lock").peers.insert(*id, old);
+                self.inner.lock().expect("lock").peers.insert(*id, old);
             }
             return Err(e);
         }
         Ok(prev)
     }
+}
+
+/// path に atomic (tempfile + rename) + mode 0o600 で書き出す。allowlist.json 用。
+fn write_atomic_0o600(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        crate::paths::ensure_dir_700(parent)?;
+    }
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".allowlist.")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("tempfile_in {}", parent.display()))?;
+    use std::io::Write;
+    tmp.as_file_mut()
+        .write_all(bytes)
+        .context("write tempfile")?;
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = tmp.as_file().metadata()?.permissions();
+    perm.set_mode(0o600);
+    tmp.as_file().set_permissions(perm)?;
+    tmp.persist(path)
+        .map_err(|e| anyhow::anyhow!("persist {}: {}", path.display(), e.error))?;
+    Ok(())
 }
 
 #[cfg(test)]

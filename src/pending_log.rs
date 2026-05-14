@@ -4,6 +4,7 @@
 //! 配下に entry を 1 file 1 entry で append する。
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -51,14 +52,44 @@ impl PendingEntry {
     }
 }
 
-/// 受信 entry を 1 file として記録する (atomic write)。file 名は
-/// `<received_at>-<source_peer 先頭 8 chars>.json`。
+/// 受信 entry を 1 file として記録する (atomic write)。file 名は衝突回避のため
+/// `<received_at>-<peer8>-<rel_hash8>-<nanos9>.json` 形式:
+/// - `received_at`: schema field (秒精度)
+/// - `peer8`: source_peer の先頭 8 文字
+/// - `rel_hash8`: rel_path の BLAKE3 hash 先頭 8 hex (= 同 peer・同 timestamp で
+///   異なる path を区別)
+/// - `nanos9`: 現在時刻の nanos 部分 (= 同 path への重複 broadcast / race を区別)
+///
+/// この組み合わせで「同一秒 + 同一 peer + 同一 path で複数 entry」が来ても上書き
+/// されずに残る (= Phase 2 review M1 対応)。
 pub fn record_receive(root: &Path, repo_hash: &str, entry: &PendingEntry) -> Result<()> {
     let dir = root.join(repo_hash);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create_dir_all {}", dir.display()))?;
+
     let short_peer: String = entry.source_peer().chars().take(8).collect();
-    let file_name = format!("{}-{}.json", entry.received_at(), short_peer);
+    let rel_hash = blake3::hash(entry.rel_path().as_bytes());
+    let rel_hash_hex: String = rel_hash
+        .as_bytes()
+        .iter()
+        .take(4)
+        .fold(String::with_capacity(8), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{:02x}", b);
+            s
+        });
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+
+    let file_name = format!(
+        "{}-{}-{}-{:09}.json",
+        entry.received_at(),
+        short_peer,
+        rel_hash_hex,
+        nanos
+    );
     let target = dir.join(file_name);
 
     let body = serde_json::to_vec_pretty(entry).context("serialize PendingEntry")?;
@@ -102,7 +133,7 @@ pub fn list_pending(root: &Path, repo_hash: &str) -> Result<Vec<PendingEntry>> {
             .with_context(|| format!("parse {}", path.display()))?;
         entries.push(e);
     }
-    entries.sort_by(|a, b| b.received_at().cmp(&a.received_at()));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.received_at()));
     Ok(entries)
 }
 
@@ -202,5 +233,28 @@ mod tests {
         record_receive(tmp.path(), "r", &upsert(1, "x", "a.md")).unwrap();
         let count = std::fs::read_dir(tmp.path().join("r")).unwrap().count();
         assert_eq!(count, 1);
+    }
+
+    /// M1 (review fix): 同 timestamp + 同 peer + 同 path で複数 entry が来ても
+    /// 上書きされず両方残る (= nanos suffix で衝突回避)。
+    #[test]
+    fn record_receive_does_not_collide_on_same_ts_peer_path() {
+        let tmp = TempDir::new().unwrap();
+        let e = upsert(100, "peer123456", "entities/foo.md");
+        for _ in 0..5 {
+            record_receive(tmp.path(), "r", &e).unwrap();
+        }
+        let entries = list_pending(tmp.path(), "r").unwrap();
+        assert_eq!(entries.len(), 5, "5 entries should all be persisted");
+    }
+
+    /// 同 timestamp + 同 peer + 異 path も区別される (= rel_hash で衝突回避)。
+    #[test]
+    fn record_receive_separates_by_rel_path() {
+        let tmp = TempDir::new().unwrap();
+        record_receive(tmp.path(), "r", &upsert(100, "peer1", "a.md")).unwrap();
+        record_receive(tmp.path(), "r", &upsert(100, "peer1", "b.md")).unwrap();
+        let entries = list_pending(tmp.path(), "r").unwrap();
+        assert_eq!(entries.len(), 2);
     }
 }

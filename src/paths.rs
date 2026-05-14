@@ -89,11 +89,13 @@ pub fn ensure_dir_700(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn with_state_dir<F: FnOnce(&Path)>(f: F) {
         let tmp = TempDir::new().unwrap();
         // SAFETY: env var を一時的に上書きしてテスト → 直後に remove する。
+        // 並行 test 間の干渉は #[serial(state_env)] で防ぐ。
         unsafe {
             std::env::set_var(STATE_DIR_ENV, tmp.path());
         }
@@ -104,6 +106,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(state_env)]
     fn socket_path_under_state_dir() {
         with_state_dir(|state| {
             assert_eq!(default_socket_path().unwrap(), state.join("daemon.sock"));
@@ -111,6 +114,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(state_env)]
     fn lock_path_under_state_dir() {
         with_state_dir(|state| {
             assert_eq!(default_lock_path().unwrap(), state.join("daemon.lock"));
@@ -118,6 +122,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(state_env)]
     fn folder_secret_path_under_state_dir() {
         with_state_dir(|state| {
             assert_eq!(
@@ -128,6 +133,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(state_env)]
     fn blobs_dir_under_state_dir() {
         with_state_dir(|state| {
             assert_eq!(default_blobs_dir().unwrap(), state.join("blobs"));
@@ -135,6 +141,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(state_env)]
     fn pending_dir_under_state_dir() {
         with_state_dir(|state| {
             assert_eq!(default_pending_dir().unwrap(), state.join("pending"));
@@ -142,6 +149,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(state_env)]
     fn allowlist_path_under_state_dir() {
         with_state_dir(|state| {
             assert_eq!(

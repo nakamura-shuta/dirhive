@@ -5,8 +5,7 @@
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use base32::Alphabet;
 use iroh::{EndpointAddr, EndpointId};
 use iroh_blobs::{BlobFormat, Hash};
 use iroh_tickets::{Ticket, endpoint::EndpointTicket};
@@ -124,9 +123,12 @@ pub fn validate_relative_path(p: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// InviteTicket: EndpointTicket + folder_secret 16 bytes を `p2psync1-<base64url>`
-// envelope で wrap する。base64url + no-pad (= URL / messenger 安全)。
+// InviteTicket: EndpointTicket + folder_secret 16 bytes を `p2psync1-<base32>`
+// envelope で wrap する。base32 (RFC 4648、no-pad) = case-insensitive で QR /
+// messenger 経路で読み間違いが起きにくい (design.md §4.2)。
 // ---------------------------------------------------------------------------
+
+const TICKET_ALPHABET: Alphabet = Alphabet::Rfc4648 { padding: false };
 
 /// invite ticket。peer 間で out-of-band で渡す。folder_secret = group identity。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +141,7 @@ pub struct InviteTicket {
 #[derive(Serialize, Deserialize)]
 struct InviteTicketJson {
     endpoint_ticket: String,
-    folder_secret: String, // base64url-no-pad encoded [u8; 16]
+    folder_secret: String, // base32 RFC 4648 no-pad encoded [u8; 16]
 }
 
 impl InviteTicket {
@@ -147,31 +149,36 @@ impl InviteTicket {
         Self { endpoint, folder_secret }
     }
 
-    /// `p2psync1-<base64url>` envelope に encode。
+    /// `p2psync1-<base32>` envelope に encode。
     pub fn encode(&self) -> Result<String> {
         let json = InviteTicketJson {
             endpoint_ticket: Ticket::encode_string(&self.endpoint),
-            folder_secret: BASE64.encode(self.folder_secret),
+            folder_secret: base32::encode(TICKET_ALPHABET, &self.folder_secret),
         };
         let bytes = serde_json::to_vec(&json).context("serialize InviteTicket")?;
-        Ok(format!("{}{}", INVITE_PREFIX, BASE64.encode(bytes)))
+        Ok(format!(
+            "{}{}",
+            INVITE_PREFIX,
+            base32::encode(TICKET_ALPHABET, &bytes)
+        ))
     }
 
-    /// `p2psync1-<base64url>` envelope から decode。
+    /// `p2psync1-<base32>` envelope から decode。base32 は case-insensitive
+    /// (= RFC 4648 §6 の "decoders SHOULD accept lower-case" を実現するため、
+    /// payload を upper-case 化してから decode する)。
     pub fn decode(s: &str) -> Result<Self> {
-        let payload = s
+        let payload_raw = s
             .strip_prefix(INVITE_PREFIX)
             .ok_or_else(|| anyhow!("missing `{}` prefix", INVITE_PREFIX))?;
-        let bytes = BASE64
-            .decode(payload)
-            .context("base64url decode InviteTicket")?;
+        let payload = payload_raw.to_ascii_uppercase();
+        let bytes = base32::decode(TICKET_ALPHABET, &payload)
+            .ok_or_else(|| anyhow!("base32 decode failed for InviteTicket envelope"))?;
         let json: InviteTicketJson =
             serde_json::from_slice(&bytes).context("deserialize InviteTicket json")?;
         let endpoint = EndpointTicket::from_str(&json.endpoint_ticket)
             .map_err(|e| anyhow!("invalid endpoint_ticket: {e}"))?;
-        let secret_bytes = BASE64
-            .decode(&json.folder_secret)
-            .context("base64url decode folder_secret")?;
+        let secret_bytes = base32::decode(TICKET_ALPHABET, &json.folder_secret.to_ascii_uppercase())
+            .ok_or_else(|| anyhow!("base32 decode failed for folder_secret"))?;
         if secret_bytes.len() != 16 {
             return Err(anyhow!(
                 "folder_secret must be 16 bytes, got {}",
@@ -306,8 +313,20 @@ mod tests {
     }
 
     #[test]
-    fn invite_ticket_rejects_invalid_base64() {
+    fn invite_ticket_rejects_invalid_base32() {
+        // `!` は base32 RFC 4648 alphabet 外 (= A-Z + 2-7 のみ)
         let e = InviteTicket::decode("p2psync1-!!!!!").unwrap_err();
-        assert!(format!("{e}").contains("base64url"));
+        assert!(format!("{e}").contains("base32"));
+    }
+
+    #[test]
+    fn invite_ticket_case_insensitive_decode() {
+        // base32 は大文字小文字に依存しない
+        let t = InviteTicket::new(fixture_endpoint_ticket(9), [0x12; 16]);
+        let encoded = t.encode().unwrap();
+        let prefix_len = INVITE_PREFIX.len();
+        let mixed = format!("{}{}", &encoded[..prefix_len], encoded[prefix_len..].to_lowercase());
+        let decoded = InviteTicket::decode(&mixed).unwrap();
+        assert_eq!(decoded, t);
     }
 }
