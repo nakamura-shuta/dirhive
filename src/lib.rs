@@ -80,9 +80,58 @@ pub struct HealthInfo {
 
 /// 健全性チェック。`daemon_state` ありなら `HealthInfoDynamic` も埋める。
 ///
-/// Phase 1 では skeleton のみ、Phase 2-3 で実装する。
+/// - **static_info** は常に埋まる: daemon_state があればその path を、 なければ
+///   `paths::default_*` を見る (= MCP server 経由で daemon が落ちている場合の
+///   probe 用途)
+/// - **dynamic_info** は daemon_state がある時だけ Some
+///
+/// シリアライズ shape は `HealthInfo` 型の派生に従う:
+/// - static fields は `#[serde(flatten)]` で top-level に展開される
+/// - `dynamic_info` だけ nested object として残る
+///   (= Phase 3 review M2、 旧 dispatch::health_check の手書き shape は廃止)
 pub fn run_health_check(
-    _daemon_state: Option<&daemon::state::DaemonState>,
+    daemon_state: Option<&daemon::state::DaemonState>,
 ) -> Result<HealthInfo> {
-    anyhow::bail!("not implemented (Phase 2-3 で実装予定)")
+    let (key_path, blobs_dir, pending_dir, watched_dir) = match daemon_state {
+        Some(s) => (
+            s.paths.key_path.clone(),
+            s.paths.blobs_dir.clone(),
+            s.pending.pending_root.clone(),
+            Some(s.paths.watched_dir_canonical.clone()),
+        ),
+        None => (
+            paths::default_key_path()?,
+            paths::default_blobs_dir()?,
+            paths::default_pending_dir()?,
+            None,
+        ),
+    };
+    let key_exists = key_path.exists();
+    let watched_dir_exists = watched_dir.as_ref().is_some_and(|p| p.exists());
+
+    let static_info = HealthInfoStatic {
+        key_path,
+        key_exists,
+        blobs_dir,
+        pending_dir,
+        watched_dir,
+        watched_dir_exists,
+    };
+
+    let dynamic_info = daemon_state.map(|s| {
+        let status = s.current_runtime_status();
+        HealthInfoDynamic {
+            peer_count: s.allowlist.len() as u32,
+            open_all: s.allowlist.is_open_all(),
+            uptime_secs: s.uptime_secs(),
+            group_initialized: status.group_initialized(),
+            gossip_subscribed: status.gossip_subscribed(),
+            restart_required: status.restart_required(),
+        }
+    });
+
+    Ok(HealthInfo {
+        static_info,
+        dynamic_info,
+    })
 }

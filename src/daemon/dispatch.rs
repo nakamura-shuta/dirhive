@@ -77,28 +77,13 @@ impl DynDispatcher for Dispatcher {
 
 impl Dispatcher {
     async fn health_check(&self) -> Result<Value> {
-        let paths = &self.state.paths;
-        let status = self.state.current_runtime_status();
-        let static_info = serde_json::json!({
-            "key_path": paths.key_path,
-            "key_exists": paths.key_path.exists(),
-            "blobs_dir": paths.blobs_dir,
-            "pending_dir": self.state.pending.pending_root,
-            "watched_dir": paths.watched_dir_canonical,
-            "watched_dir_exists": paths.watched_dir_canonical.exists(),
-        });
-        let dynamic_info = serde_json::json!({
-            "peer_count": self.state.allowlist.len() as u32,
-            "open_all": self.state.allowlist.is_open_all(),
-            "uptime_secs": self.state.uptime_secs(),
-            "group_initialized": status.group_initialized(),
-            "gossip_subscribed": status.gossip_subscribed(),
-            "restart_required": status.restart_required(),
-        });
-        Ok(serde_json::json!({
-            "static_info": static_info,
-            "dynamic_info": dynamic_info,
-        }))
+        // `lib::run_health_check` の戻り値 (= 公開型 HealthInfo) を serialize する。
+        // HealthInfo は static_info を `#[serde(flatten)]`、 dynamic_info を Option<...>
+        // で持つので、 JSON 上は static field が top-level に出て、 dynamic_info
+        // だけが nested object になる (= Phase 3 review M2)。
+        let info = crate::run_health_check(Some(&self.state))
+            .context("run_health_check")?;
+        serde_json::to_value(info).context("serialize HealthInfo")
     }
 
     async fn status(&self) -> Result<Value> {
@@ -126,20 +111,25 @@ impl Dispatcher {
     async fn invite(&self) -> Result<Value> {
         let paths = &self.state.paths;
         // folder_secret 既存 → 既存 ticket、 不在 → 新規 generate + persist
-        let (folder_secret, restart_required) =
-            match keystore::try_load_folder_secret(&paths.folder_secret_path)? {
-                Some(s) => (s, false),
-                None => {
-                    let s = keystore::generate_and_persist_folder_secret(&paths.folder_secret_path)?;
-                    // group_initialized = true へ昇格 (gossip_subscribed はまだ false)
-                    self.state.enter_initialized_but_not_subscribed();
-                    (s, true)
-                }
-            };
+        let folder_secret = match keystore::try_load_folder_secret(&paths.folder_secret_path)? {
+            Some(s) => s,
+            None => {
+                let s = keystore::generate_and_persist_folder_secret(&paths.folder_secret_path)?;
+                // group_initialized = true へ昇格 (gossip_subscribed はまだ false)
+                self.state.enter_initialized_but_not_subscribed();
+                s
+            }
+        };
 
         let addr = self.state.endpoint.addr();
         let endpoint_ticket = EndpointTicket::new(addr);
         let ticket = InviteTicket::new(endpoint_ticket, folder_secret).encode()?;
+
+        // restart_required は **「 今回 secret を作ったか 」 ではなく現在の真の
+        // runtime_status から導く** (= Phase 3 review H1)。 初回 generate 後の
+        // 2 回目 invite でも、 daemon 再起動するまで restart_required = true の
+        // ままにする (= 7-step bilateral flow の再起動指示を消さない)。
+        let restart_required = self.state.current_runtime_status().restart_required();
         Ok(serde_json::json!({
             "ticket": ticket,
             "restart_required": restart_required,
@@ -158,17 +148,16 @@ impl Dispatcher {
         let inviter_id = invite.endpoint.endpoint_addr().id;
 
         // folder_secret 整合 check + adopt:
-        // - 不在 → adopt + persist + restart_required = true
+        // - 不在 → adopt + persist + enter_initialized_but_not_subscribed
         // - 既存 == invite.folder_secret → noop (= 既に同 group)
         // - 既存 != invite.folder_secret → reject (= group merge は MVP scope 外)
         let paths = &self.state.paths;
-        let restart_required = match keystore::try_load_folder_secret(&paths.folder_secret_path)? {
+        match keystore::try_load_folder_secret(&paths.folder_secret_path)? {
             None => {
                 keystore::persist_folder_secret(&paths.folder_secret_path, &invite.folder_secret)?;
                 self.state.enter_initialized_but_not_subscribed();
-                true
             }
-            Some(existing) if existing == invite.folder_secret => false,
+            Some(existing) if existing == invite.folder_secret => {}
             Some(_) => {
                 return Err(anyhow!(
                     "this daemon is already initialized with a different folder_secret; \
@@ -185,6 +174,8 @@ impl Dispatcher {
             .allowlist
             .add_and_save(inviter_id, info, &paths.allowlist_path)?;
 
+        // restart_required は真の runtime_status から (= H1 review fix)。
+        let restart_required = self.state.current_runtime_status().restart_required();
         Ok(serde_json::json!({
             "peer_id": inviter_id.to_string(),
             "label": p.label,
@@ -306,11 +297,48 @@ fn tail_lines_redacted(log_path: &std::path::Path, n: usize) -> Result<Vec<Strin
     Ok(lines)
 }
 
-/// `p2psync1-` envelope や 32+ hex の secret-like token を `<redacted>` に置換。
+/// `p2psync1-` envelope と 32+ 文字の連続 hex token を `<redacted>` に置換。
+///
+/// design §6.2 の secret 漏洩防止 layer:
+/// - `p2psync1-` envelope: invite ticket (= folder_secret を含む) 漏れ防止
+/// - 32+ hex token: endpoint key / folder_secret / blob hash 等の長 hex 漏れ防止
+///
 /// 完全な検査は難しいので「 design で機密と決めた prefix / 長 hex 」 を粗く隠す。
+/// 短い hex (= blob short id 等) は保つ (= debug log の useful information を残す)。
 fn redact_secrets(line: impl AsRef<str>) -> String {
-    // p2psync1-... envelope を `<redacted>` に置換 (= 空白 / 制御文字まで)
-    redact_pattern(line.as_ref(), "p2psync1-")
+    let s = line.as_ref();
+    let s = redact_pattern(s, "p2psync1-");
+    redact_hex_token(&s, MIN_REDACT_HEX_LEN)
+}
+
+/// hex token を redact する最小文字数 (= Phase 3 review L5)。
+///
+/// 32 hex = 16 bytes = folder_secret サイズ / 4。 これより短い token (= 8 hex の
+/// short peer id 等) は redact しない (= log の可読性維持)。
+pub const MIN_REDACT_HEX_LEN: usize = 32;
+
+/// 連続する hex 文字が `min_len` 以上の token を `<redacted>` に置換する。
+fn redact_hex_token(s: &str, min_len: usize) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut buf = String::new();
+    let flush = |buf: &mut String, out: &mut String| {
+        if buf.len() >= min_len {
+            out.push_str("<redacted>");
+        } else {
+            out.push_str(buf);
+        }
+        buf.clear();
+    };
+    for c in s.chars() {
+        if c.is_ascii_hexdigit() {
+            buf.push(c);
+        } else {
+            flush(&mut buf, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut buf, &mut out);
+    out
 }
 
 fn redact_pattern(s: &str, prefix: &str) -> String {
@@ -378,7 +406,11 @@ mod tests {
             .await
             .unwrap();
         let folder_secret = if with_folder_secret {
-            Some([0xABu8; 16])
+            let secret = [0xABu8; 16];
+            // **disk にも persist** する: daemon 起動時の load-or-create と整合させ、
+            // 後から invite が `try_load_folder_secret` で正しく既存値を拾えるようにする。
+            keystore::persist_folder_secret(&paths.folder_secret_path, &secret).unwrap();
+            Some(secret)
         } else {
             None
         };
@@ -418,14 +450,23 @@ mod tests {
         (Dispatcher::new(Arc::new(state)), state_tmp, watch_tmp)
     }
 
+    /// M2 review fix: static_info は top-level flatten、 dynamic_info だけ nested。
+    /// 公開型 HealthInfo の serde shape と一致する。
     #[tokio::test]
-    async fn health_check_returns_static_and_dynamic() {
+    async fn health_check_returns_static_flat_and_dynamic_nested() {
         let (d, _s, _w) = build_dispatcher(0x11, true).await;
         let v = d.health_check().await.unwrap();
-        assert!(v["static_info"]["watched_dir_exists"].as_bool().unwrap());
+        // static fields は top-level (flatten 済)
+        assert!(v["watched_dir_exists"].as_bool().unwrap());
+        assert!(v["key_path"].is_string());
+        assert!(v["blobs_dir"].is_string());
+        assert!(v["pending_dir"].is_string());
+        // dynamic_info は nested object
         assert!(v["dynamic_info"]["group_initialized"].as_bool().unwrap());
         assert!(v["dynamic_info"]["gossip_subscribed"].as_bool().unwrap());
         assert!(!v["dynamic_info"]["restart_required"].as_bool().unwrap());
+        // 旧 shape の `static_info` nested は無くなった
+        assert!(v.get("static_info").is_none(), "static_info nested key must be gone");
     }
 
     #[tokio::test]
@@ -446,6 +487,9 @@ mod tests {
         assert_eq!(v["recent_pending_count"], 0);
     }
 
+    /// H1 review fix: restart_required は runtime_status から導く。 初回 generate
+    /// 後の 2 回目 invite でも、 daemon 再起動するまで true のまま (= 7-step
+    /// bilateral flow の再起動指示を消さない)。
     #[tokio::test]
     async fn invite_first_call_generates_secret_and_sets_restart_required() {
         let (d, _s, _w) = build_dispatcher(0x14, false).await;
@@ -453,9 +497,23 @@ mod tests {
         assert!(v["ticket"].as_str().unwrap().starts_with("p2psync1-"));
         assert_eq!(v["restart_required"], true);
 
-        // 2 回目は既存 secret → restart_required = false
+        // 2 回目: 既存 secret を使うが、 daemon 自身は InitializedButNotSubscribed
+        // のまま (= 再起動してない) → restart_required も true のまま
         let v2 = d.invite().await.unwrap();
-        assert_eq!(v2["restart_required"], false);
+        assert_eq!(v2["restart_required"], true, "must stay true until daemon restart");
+        // ticket 内容は同じ (= 同じ secret から再構築)
+        assert_eq!(v["ticket"], v2["ticket"]);
+    }
+
+    /// H1 review fix: daemon が既に Active (= 起動時に subscribe 済) なら、
+    /// invite は restart_required = false を返す。
+    #[tokio::test]
+    async fn invite_returns_no_restart_when_already_active() {
+        let (d, _s, _w) = build_dispatcher(0x17, true).await;
+        // build_dispatcher の with_folder_secret=true で起動時 Active になっている
+        assert!(!d.state.current_runtime_status().restart_required());
+        let v = d.invite().await.unwrap();
+        assert_eq!(v["restart_required"], false);
     }
 
     #[tokio::test]
@@ -584,6 +642,45 @@ mod tests {
         assert!(r.contains("<redacted>"));
         assert!(!r.contains("ABC123XYZ"));
         assert!(r.contains("for bob"));
+    }
+
+    /// L5 review fix: 32+ hex token も redact される。
+    #[test]
+    fn redact_hex_token_replaces_long_hex() {
+        let long_hex = "deadbeefcafebabe0123456789abcdef"; // 32 chars hex
+        let s = format!("key={long_hex} owner=alice");
+        let r = redact_hex_token(&s, MIN_REDACT_HEX_LEN);
+        assert!(r.contains("<redacted>"));
+        assert!(!r.contains(long_hex));
+        assert!(r.contains("owner=alice"));
+    }
+
+    /// 32 文字未満の hex は維持される (= short id / 部分 hash 等の log 可読性維持)。
+    #[test]
+    fn redact_hex_token_keeps_short_hex_intact() {
+        let short = "abcd1234"; // 8 hex
+        let s = format!("peer={short} status=ok");
+        let r = redact_hex_token(&s, MIN_REDACT_HEX_LEN);
+        assert_eq!(r, s);
+    }
+
+    /// 連続 hex の途中に区切り (`-` / `:`) があれば、 個別 segment 長で判定される。
+    #[test]
+    fn redact_hex_token_segments_at_non_hex_boundary() {
+        // 16 hex + ":" + 16 hex は両方 < 32 で redact されない
+        let s = "id=01234567abcdef89:9876543210abcdef done";
+        let r = redact_hex_token(s, MIN_REDACT_HEX_LEN);
+        assert_eq!(r, s);
+    }
+
+    /// redact_secrets 統合 path: p2psync1- envelope と長 hex の両方が消える。
+    #[test]
+    fn redact_secrets_handles_both_patterns() {
+        let s = "warn invite=p2psync1-AAAABBBBCCCC then hash=00112233445566778899aabbccddeeff00112233";
+        let r = redact_secrets(s);
+        assert!(!r.contains("AAAABBBBCCCC"));
+        assert!(!r.contains("00112233445566778899aabbccddeeff00112233"));
+        assert!(r.matches("<redacted>").count() >= 2);
     }
 
     #[test]

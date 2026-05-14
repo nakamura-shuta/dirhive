@@ -62,10 +62,12 @@ async fn daemon_starts_and_responds_to_health_check() {
     let (mut child, socket) = spawn_daemon(watch_tmp.path(), state_tmp.path()).await;
 
     // health-check 応答内容を確認
+    // M2 review fix: static fields は top-level flatten、 dynamic_info だけ nested。
     let v = rpc(&socket, "sync.health-check", serde_json::json!({}))
         .await
         .expect("health-check rpc");
-    assert!(v["static_info"]["watched_dir_exists"].as_bool().unwrap());
+    assert!(v["watched_dir_exists"].as_bool().unwrap());
+    assert!(v["key_path"].is_string());
     // folder_secret 未生成 → group_initialized = false
     assert_eq!(v["dynamic_info"]["group_initialized"], false);
 
@@ -103,11 +105,13 @@ async fn daemon_invite_first_call_sets_restart_required() {
     assert!(v["ticket"].as_str().unwrap().starts_with("p2psync1-"));
     assert_eq!(v["restart_required"], true);
 
-    // 2 回目は restart_required = false
+    // 2 回目: 既存 secret を使うが daemon は再起動してない (=
+    // InitializedButNotSubscribed のまま) → restart_required も true のまま
+    // (= H1 review fix: 7-step bilateral flow の再起動指示を消さない)
     let v2 = rpc(&socket, "sync.invite", serde_json::json!({}))
         .await
         .expect("invite second");
-    assert_eq!(v2["restart_required"], false);
+    assert_eq!(v2["restart_required"], true);
     assert_eq!(v["ticket"], v2["ticket"]);
 
     let pid = child.id().unwrap() as i32;

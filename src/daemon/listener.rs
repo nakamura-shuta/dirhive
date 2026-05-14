@@ -177,7 +177,10 @@ pub async fn probe_existing_socket(socket_path: &Path) -> bool {
     matches!(result, Ok(Some(_)))
 }
 
-/// socket bind + chmod 0o600 + accept_loop spawn。
+/// socket bind + chmod 0o600 + accept_loop spawn。 lock 取得 + stale recover まで
+/// 一括で行う。 daemon main から呼ぶ場合は **side effect の少ない** Iroh bind より
+/// 前段で `acquire_daemon_lock` + `probe_existing_socket` を実行したいので、
+/// `bind_listener_with_lock` 経由が推奨 (= Phase 3 review M4)。
 pub async fn bind_listener(
     socket_path: &Path,
     lock_path: &Path,
@@ -198,7 +201,28 @@ pub async fn bind_listener(
             .with_context(|| format!("unlink stale socket {}", socket_path.display()))?;
     }
 
-    // 3. parent dir + bind + chmod 0o600
+    bind_listener_with_lock(socket_path, lock_file, dispatcher).await
+}
+
+/// lock 既取得 + stale recover 済の前提で socket bind + accept_loop spawn だけ
+/// 行う。 daemon main は network side effect (= Iroh bind) より前に lock /
+/// probe を済ませてから本 fn に lock_file を渡すことで、 多重起動 2 個目の
+/// daemon が relay / endpoint key load を実行する前に reject される
+/// (= Phase 3 review M4)。
+pub async fn bind_listener_with_lock(
+    socket_path: &Path,
+    lock_file: std::fs::File,
+    dispatcher: Arc<dyn DynDispatcher>,
+) -> Result<ListenerHandle> {
+    if socket_path.exists() {
+        return Err(anyhow!(
+            "bind_listener_with_lock: socket {} already exists (caller must \
+             unlink stale before invoking)",
+            socket_path.display()
+        ));
+    }
+
+    // parent dir + bind + chmod 0o600
     if let Some(parent) = socket_path.parent() {
         crate::paths::ensure_dir_700(parent)?;
     }
@@ -208,7 +232,7 @@ pub async fn bind_listener(
     perm.set_mode(0o600);
     std::fs::set_permissions(socket_path, perm)?;
 
-    // 4. accept_loop spawn (= connection cap semaphore を共有)
+    // accept_loop spawn (= connection cap semaphore を共有)
     let shutdown = CancellationToken::new();
     let shutdown2 = shutdown.clone();
     let socket_path_buf = socket_path.to_path_buf();
@@ -494,6 +518,42 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock = tmp.path().join("nothing.sock");
         assert!(!probe_existing_socket(&sock).await);
+    }
+
+    /// M4 review fix: `bind_listener_with_lock` で early lock を pass-through できる
+    /// = daemon main が Iroh bind より前に lock 取得 + stale recover を済ませる経路。
+    #[tokio::test]
+    async fn bind_listener_with_lock_accepts_pre_acquired_lock() {
+        let (_tmp, sock, lock) = fresh_paths("early_lock");
+        let lock_file = acquire_daemon_lock(&lock).unwrap();
+        let h = bind_listener_with_lock(&sock, lock_file, Arc::new(EchoDispatcher))
+            .await
+            .unwrap();
+        // 連動 RPC が通る
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        stream
+            .write_all(b"{\"method\":\"sync.health-check\"}\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let resp: RpcResponse = serde_json::from_str(line.trim()).unwrap();
+        assert!(resp.error.is_none());
+        h.shutdown().await.unwrap();
+    }
+
+    /// `bind_listener_with_lock` は **stale socket が残っていれば error** にする
+    /// (= caller が unlink を済ませる前提)。
+    #[tokio::test]
+    async fn bind_listener_with_lock_rejects_existing_socket() {
+        let (_tmp, sock, lock) = fresh_paths("with_stale");
+        std::fs::write(&sock, b"stale").unwrap();
+        let lock_file = acquire_daemon_lock(&lock).unwrap();
+        let e = bind_listener_with_lock(&sock, lock_file, Arc::new(EchoDispatcher))
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("already exists"));
     }
 
     #[test]

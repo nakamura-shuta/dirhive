@@ -1,34 +1,42 @@
 //! p2p-sync daemon binary (= L2 daemon、 design.md §5.1)。
 //!
-//! ## 起動シーケンス (= design §5.1)
+//! ## 起動シーケンス (= design §5.1 の順序を遵守)
 //!
 //! 1. CLI arg parse
 //! 2. watched_dir canonicalize
-//! 3. tracing 初期化 (= log file への JSON 出力)
-//! 4. endpoint.key load / generate
-//! 5. folder_secret lazy load (= 不在なら group_initialized = false で起動)
-//! 6. Endpoint::bind + online
-//! 7. blobs_dir prepare 0o700
-//! 8. allowlist load (file 不在 → strict empty、 --allow-open-all で open_all)
-//! 9. SyncRuntime::build (blob + Router + AllowlistBlobs wrap + 必要なら gossip subscribe)
-//! 10. DaemonState 構築 + Dispatcher 構築
-//! 11. spawn_listener (Unix socket、 0o600)
-//! 12. spawn watcher + receive_loop (group_initialized 不問で RPC は応答)
-//! 13. tokio::select! で SIGINT / SIGTERM 待機 → graceful shutdown
+//! 3. paths 解決 + log file 用 dir 用意
+//! 4. tracing 初期化 (= stderr + log file の両方に出力、 M3)
+//! 5. **早期** daemon_lock 取得 + stale socket recover (= M4: Iroh bind より前)
+//! 6. endpoint.key load / generate
+//! 7. folder_secret lazy load
+//! 8. Endpoint::bind + online
+//! 9. blobs_dir 0o700 prepare
+//! 10. allowlist load (file 不在 → strict empty、 --allow-open-all で open_all)
+//! 11. SyncRuntime::build
+//! 12. DaemonState 構築
+//! 13. listener spawn (`bind_listener_with_lock` で early lock を pass-through)
+//! 14. (Phase 3 後半で wire) watcher + receive_loop
+//! 15. SIGINT / SIGTERM 待機 → graceful shutdown
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use p2p_dir_sync::allowlist::AllowList;
 use p2p_dir_sync::daemon::dispatch::Dispatcher;
-use p2p_dir_sync::daemon::listener::{DynDispatcher, bind_listener};
+use p2p_dir_sync::daemon::listener::{
+    DynDispatcher, acquire_daemon_lock, bind_listener_with_lock, probe_existing_socket,
+};
 use p2p_dir_sync::daemon::state::{DaemonPaths, DaemonState, RuntimeStatus};
 use p2p_dir_sync::keystore;
 use p2p_dir_sync::paths;
 use p2p_dir_sync::runtime::SyncRuntime;
 use p2p_dir_sync::state::{PendingTracker, SyncState};
+use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
 #[command(name = "p2p-sync", version, about = "P2P directory sync daemon")]
@@ -53,8 +61,11 @@ async fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("canonicalize --watch {}", cli.watch.display()))?;
 
-    // (3) tracing 初期化 (best-effort、 log file に書く)
-    init_tracing()?;
+    // (3) paths 解決
+    let daemon_paths = build_daemon_paths(&watched_dir)?;
+
+    // (4) tracing 初期化 (stderr + log file、 sync.recent-log が tail する file)
+    init_tracing(&daemon_paths.log_path)?;
 
     if cli.allow_open_all {
         tracing::warn!(
@@ -64,18 +75,36 @@ async fn main() -> Result<()> {
         eprintln!("WARNING: --allow-open-all is set; this is a dev-only mode.");
     }
 
-    // (4, 5, 7, 8 の path 解決)
-    let daemon_paths = build_daemon_paths(&watched_dir)?;
+    // (5) **早期** lock + stale recover (= M4 review fix)。
+    // Iroh の relay 接続 / endpoint key 生成 など side effect の起きる処理より
+    // 前に多重起動 check を済ませ、 2 個目の daemon は network に触らずに exit する。
+    let lock_file = acquire_daemon_lock(&daemon_paths.lock_path)
+        .context("acquire daemon.lock (another daemon may already be running)")?;
+    if daemon_paths.socket_path.exists() {
+        if probe_existing_socket(&daemon_paths.socket_path).await {
+            anyhow::bail!(
+                "another daemon is already listening on {}",
+                daemon_paths.socket_path.display()
+            );
+        }
+        std::fs::remove_file(&daemon_paths.socket_path).with_context(|| {
+            format!("unlink stale socket {}", daemon_paths.socket_path.display())
+        })?;
+        tracing::info!(
+            socket = %daemon_paths.socket_path.display(),
+            "removed stale socket"
+        );
+    }
 
-    // (4) endpoint.key
+    // (6) endpoint.key
     let secret_key = keystore::load_or_create_endpoint_key(&daemon_paths.key_path)
         .context("load or create endpoint.key")?;
 
-    // (5) folder_secret lazy load
+    // (7) folder_secret lazy load
     let folder_secret = keystore::try_load_folder_secret(&daemon_paths.folder_secret_path)
         .context("try_load_folder_secret")?;
 
-    // (6) Endpoint::bind + online
+    // (8) Endpoint::bind + online
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key)
         .bind()
@@ -84,10 +113,10 @@ async fn main() -> Result<()> {
     endpoint.online().await;
     tracing::info!(endpoint_id = %endpoint.id(), "endpoint online");
 
-    // (7) blobs_dir 0o700
+    // (9) blobs_dir 0o700
     paths::ensure_dir_700(&daemon_paths.blobs_dir)?;
 
-    // (8) allowlist load
+    // (10) allowlist load
     let allowlist = if cli.allow_open_all {
         Arc::new(AllowList::open_all())
     } else {
@@ -97,7 +126,7 @@ async fn main() -> Result<()> {
         )
     };
 
-    // (9) SyncRuntime::build
+    // (11) SyncRuntime::build
     let mut sync_runtime = SyncRuntime::build(
         endpoint.clone(),
         &daemon_paths.blobs_dir,
@@ -107,17 +136,15 @@ async fn main() -> Result<()> {
     .await
     .context("SyncRuntime::build")?;
 
-    // (10) DaemonState 構築 + Dispatcher 構築
+    // (12) DaemonState 構築
     let (gossip_sender_opt, runtime_status) = match folder_secret {
         Some(_) => {
-            // group_initialized = true、 subscribe 済 → Active。
-            // GossipTopic を split して sender/receiver を取り出す
             let topic = sync_runtime
                 .take_topic()
                 .context("SyncRuntime::take_topic (group_initialized なのに None)")?;
             let (sender, receiver) = topic.split();
-            // receiver は Phase 3 後半で receive_loop に渡す予定 (= ここでは drop しない)
-            // 一旦 leak で hold する → Phase 3 後半で正規 spawn に書き換える
+            // receiver は Phase 3 後半で receive_loop に渡す予定 (= ここでは hold する)
+            // 一旦 leak で hold (= drop すると topic から leave してしまう)
             std::mem::forget(receiver);
             (Some(sender), RuntimeStatus::Active)
         }
@@ -139,26 +166,23 @@ async fn main() -> Result<()> {
         runtime_status,
     ));
 
-    // (11) listener spawn
+    // (13) listener spawn (early lock を pass-through)
     let dispatcher: Arc<dyn DynDispatcher> = Arc::new(Dispatcher::new(state.clone()));
-    let listener_handle = bind_listener(
+    let listener_handle = bind_listener_with_lock(
         &daemon_paths.socket_path,
-        &daemon_paths.lock_path,
+        lock_file,
         dispatcher,
     )
     .await
-    .context("bind_listener")?;
+    .context("bind_listener_with_lock")?;
     tracing::info!(
         socket = %daemon_paths.socket_path.display(),
         "daemon listening"
     );
 
-    // (12) watcher + receive_loop:
-    // Phase 3 後半で正規実装 (= watcher_loop が send_file を呼ぶ wiring、
-    // receive_loop が mark_peer_seen callback で DaemonState を更新する wiring)。
-    // 本 step では「 daemon が RPC に応答できる骨格 」 までを完成させる。
+    // (14) Phase 3 後半で watcher + receive_loop を spawn する。
 
-    // (13) SIGINT / SIGTERM 待機 → graceful shutdown
+    // (15) SIGINT / SIGTERM 待機 → graceful shutdown
     wait_for_shutdown_signal().await?;
     tracing::info!("shutdown signal received");
     listener_handle.shutdown().await.context("listener shutdown")?;
@@ -170,7 +194,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_daemon_paths(watched_dir: &std::path::Path) -> Result<DaemonPaths> {
+fn build_daemon_paths(watched_dir: &Path) -> Result<DaemonPaths> {
     Ok(DaemonPaths {
         watched_dir_canonical: watched_dir.to_path_buf(),
         socket_path: paths::default_socket_path()?,
@@ -183,17 +207,62 @@ fn build_daemon_paths(watched_dir: &std::path::Path) -> Result<DaemonPaths> {
     })
 }
 
-fn init_tracing() -> Result<()> {
-    use tracing_subscriber::{EnvFilter, fmt};
+/// stderr と log file の両方に出力する tracing initialization (= M3 review fix)。
+/// sync.recent-log が log_path を tail するので、 launchd で stderr redirect しない
+/// 環境 (= binary 直起動 / integration test) でも log entry が file に残る。
+fn init_tracing(log_path: &Path) -> Result<()> {
     let filter = EnvFilter::try_from_env("P2P_SYNC_LOG")
         .unwrap_or_else(|_| EnvFilter::new("info,p2p_dir_sync=debug"));
-    fmt()
-        .with_env_filter(filter)
+
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create log parent {}", parent.display()))?;
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("open log file {}", log_path.display()))?;
+    let shared = SharedFileWriter(Arc::new(Mutex::new(log_file)));
+
+    let stderr_layer = fmt::layer()
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(io::stderr);
+
+    let file_layer = fmt::layer()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(shared);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer)
         .try_init()
-        .ok(); // 重複 init は ignore
+        .map_err(|e| anyhow!("tracing init: {e}"))?;
     Ok(())
+}
+
+/// 1 個の `File` を複数 layer / 複数 event で共有するための `MakeWriter` 実装。
+#[derive(Clone)]
+struct SharedFileWriter(Arc<Mutex<File>>);
+
+impl<'a> MakeWriter<'a> for SharedFileWriter {
+    type Writer = SharedFileGuard<'a>;
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedFileGuard(self.0.lock().expect("log file mutex poisoned"))
+    }
+}
+
+struct SharedFileGuard<'a>(MutexGuard<'a, File>);
+
+impl Write for SharedFileGuard<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {
