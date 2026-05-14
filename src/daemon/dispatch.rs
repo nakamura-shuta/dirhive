@@ -30,7 +30,7 @@ use crate::message::InviteTicket;
 use crate::pending_log;
 
 use super::listener::{DynDispatcher, RpcRequest, RpcResponse};
-use super::state::{DaemonState, RuntimeStatus};
+use super::state::DaemonState;
 
 /// sync.* RPC dispatcher。
 #[derive(Debug, Clone)]
@@ -132,8 +132,7 @@ impl Dispatcher {
                 None => {
                     let s = keystore::generate_and_persist_folder_secret(&paths.folder_secret_path)?;
                     // group_initialized = true へ昇格 (gossip_subscribed はまだ false)
-                    self.state
-                        .set_runtime_status(RuntimeStatus::InitializedButNotSubscribed);
+                    self.state.enter_initialized_but_not_subscribed();
                     (s, true)
                 }
             };
@@ -166,8 +165,7 @@ impl Dispatcher {
         let restart_required = match keystore::try_load_folder_secret(&paths.folder_secret_path)? {
             None => {
                 keystore::persist_folder_secret(&paths.folder_secret_path, &invite.folder_secret)?;
-                self.state
-                    .set_runtime_status(RuntimeStatus::InitializedButNotSubscribed);
+                self.state.enter_initialized_but_not_subscribed();
                 true
             }
             Some(existing) if existing == invite.folder_secret => false,
@@ -347,6 +345,7 @@ struct _PingPong;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::state::RuntimeStatus;
     use crate::allowlist::AllowList;
     use crate::message::PeerRef;
     use crate::runtime::SyncRuntime;

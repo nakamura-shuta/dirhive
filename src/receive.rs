@@ -46,7 +46,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
 use futures_lite::StreamExt;
-use iroh::Endpoint;
+use iroh::{Endpoint, EndpointId};
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat};
 use iroh_gossip::api::{Event, GossipReceiver};
 
@@ -57,6 +57,19 @@ use crate::pending_log::{PENDING_SCHEMA_VERSION, PendingEntry, record_receive};
 use crate::send::{MAX_FILE_SIZE, resolve_safe_path};
 use crate::state::{PendingTracker, SyncState};
 
+/// data-plane 成立観測 callback (= Phase 3 review L4)。
+///
+/// `handle_upsert` / `handle_tombstone` が Applied を返した直後に caller (= daemon)
+/// が DaemonState::mark_peer_seen を呼べるようにする hook 型。 None なら何もしない。
+///
+/// 呼ばれる契機:
+/// - Upsert 成功 (= blob fetch + atomic write 完了): from_id を渡す
+/// - Tombstone 成功 (= unlink or NotFound 完了): from_id を渡す
+///
+/// blob serve 側 (= AllowlistBlobs::accept で provider session 完了) は別 callback
+/// で繋ぐ想定 (= Phase 3 後半で AllowlistBlobs に追加予定)。
+pub type PeerSeenCallback = Arc<dyn Fn(EndpointId, i64) + Send + Sync>;
+
 /// receive 経路の動作結果 (= test で観測しやすくするため enum 化)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiveOutcome {
@@ -66,6 +79,10 @@ pub enum ReceiveOutcome {
 
 /// receive_loop の per-event ハンドラ。 本体 loop は GossipReceiver から
 /// `Event::Received` を取り出して `dispatch_update` に渡し、 他 event は log。
+///
+/// `on_peer_seen` は Applied 時の data-plane 成功通知 callback (= L4)。 None なら
+/// 何もしない (= 単独 use case では callback 不要)。
+#[allow(clippy::too_many_arguments)]
 pub async fn receive_loop(
     mut receiver: GossipReceiver,
     endpoint: Endpoint,
@@ -74,6 +91,7 @@ pub async fn receive_loop(
     state: SyncState,
     watched_dir_canonical: PathBuf,
     pending: Arc<PendingTracker>,
+    on_peer_seen: Option<PeerSeenCallback>,
 ) -> Result<()> {
     while let Some(event) = receiver.next().await {
         let event = match event {
@@ -93,6 +111,7 @@ pub async fn receive_loop(
                     &state,
                     &watched_dir_canonical,
                     &pending,
+                    on_peer_seen.as_ref(),
                 )
                 .await;
                 match outcome {
@@ -122,6 +141,8 @@ pub async fn receive_loop(
 /// 2. `allowlist.contains(from.id)` で受信認可 check (= drop or 続行)
 /// 3. body によって handle_upsert / handle_tombstone に dispatch
 /// 4. pending_log に entry を 1 件 append
+/// 5. `on_peer_seen` callback を invoke (= L4 mark_peer_seen hook)
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_update(
     payload: &[u8],
     endpoint: &Endpoint,
@@ -130,6 +151,7 @@ pub async fn dispatch_update(
     state: &SyncState,
     watched_dir_canonical: &Path,
     pending: &Arc<PendingTracker>,
+    on_peer_seen: Option<&PeerSeenCallback>,
 ) -> Result<ReceiveOutcome> {
     let update = match SyncUpdate::from_bytes(payload) {
         Ok(u) => u,
@@ -183,6 +205,9 @@ pub async fn dispatch_update(
                 if let Err(e) = record_receive(&pending.pending_root, &pending.repo_hash, &entry) {
                     tracing::warn!("pending_log record_receive failed: {e:#}");
                 }
+                if let Some(cb) = on_peer_seen {
+                    cb(from.id, received_at);
+                }
             }
             Ok(outcome)
         }
@@ -197,6 +222,9 @@ pub async fn dispatch_update(
                 };
                 if let Err(e) = record_receive(&pending.pending_root, &pending.repo_hash, &entry) {
                     tracing::warn!("pending_log record_receive failed: {e:#}");
+                }
+                if let Some(cb) = on_peer_seen {
+                    cb(from.id, received_at);
                 }
             }
             Ok(outcome)
@@ -537,6 +565,7 @@ mod tests {
             &state,
             &watch_root,
             &pending,
+            None,
         )
         .await
         .unwrap();
@@ -570,6 +599,7 @@ mod tests {
             &state,
             &watch_root,
             &pending,
+            None,
         )
         .await
         .unwrap();
@@ -743,6 +773,14 @@ mod tests {
                 .unwrap();
         let payload = update.to_bytes().unwrap();
 
+        // L4 review fix: data-plane 成立 callback も検証する
+        let seen: Arc<std::sync::Mutex<Vec<(iroh::EndpointId, i64)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let cb: PeerSeenCallback = Arc::new(move |id, t| {
+            seen2.lock().unwrap().push((id, t));
+        });
+
         let outcome = dispatch_update(
             &payload,
             rt.endpoint(),
@@ -751,6 +789,7 @@ mod tests {
             &state,
             &watch_root,
             &pending,
+            Some(&cb),
         )
         .await
         .unwrap();
@@ -759,6 +798,10 @@ mod tests {
             std::fs::read(watch_root.join("dispatched.md")).unwrap(),
             b"payload"
         );
+        // peer_seen callback が Upsert 成功で 1 回呼ばれる
+        let seen_vec = seen.lock().unwrap().clone();
+        assert_eq!(seen_vec.len(), 1, "callback should fire once");
+        assert_eq!(seen_vec[0].0, from_id);
         // pending_log entry も 1 件できた
         let entries = std::fs::read_dir(pending.pending_root.join(&pending.repo_hash))
             .unwrap()

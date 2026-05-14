@@ -21,6 +21,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +30,20 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// `sync.health-check` probe の timeout。 stale socket recover で使う。
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// 1 connection あたりの read timeout (= Phase 3 review M2)。
+///
+/// MCP / CLI / 統合 test が誤動作して newline を送らないケースで fd / task が
+/// 溜まるのを防ぐ。 same-uid threat 外でも防御 (= dispatch が iroh stack を
+/// 叩いて時間かかる前提で十分余裕を取る)。
+pub const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 同時 accept 中 connection の上限 (= Phase 3 review M2)。
+///
+/// MCP / CLI からの呼び出しは普段 1-2 connection でしか到来しない。
+/// 32 は「 burst で来ても捌けて、 fd 制限内に収まる 」 妥協値。
+/// 超過した accept は connection を即 close する (= response 返さない)。
+pub const MAX_IN_FLIGHT_CONNECTIONS: usize = 32;
 
 /// JSON-RPC-lite request (= `method` + `params` の 2 field、 id は持たない)。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,12 +208,13 @@ pub async fn bind_listener(
     perm.set_mode(0o600);
     std::fs::set_permissions(socket_path, perm)?;
 
-    // 4. accept_loop spawn
+    // 4. accept_loop spawn (= connection cap semaphore を共有)
     let shutdown = CancellationToken::new();
     let shutdown2 = shutdown.clone();
     let socket_path_buf = socket_path.to_path_buf();
+    let conn_sem = Arc::new(Semaphore::new(MAX_IN_FLIGHT_CONNECTIONS));
     let task = tokio::spawn(async move {
-        accept_loop(listener, dispatcher, shutdown2).await;
+        accept_loop(listener, dispatcher, shutdown2, conn_sem).await;
     });
 
     Ok(ListenerHandle {
@@ -213,6 +229,7 @@ async fn accept_loop(
     listener: UnixListener,
     dispatcher: Arc<dyn DynDispatcher>,
     shutdown: CancellationToken,
+    conn_sem: Arc<Semaphore>,
 ) {
     loop {
         tokio::select! {
@@ -224,8 +241,22 @@ async fn accept_loop(
             res = listener.accept() => {
                 match res {
                     Ok((stream, _)) => {
+                        // semaphore で同時 in-flight connection 数を制限。
+                        // try_acquire_owned で「 即取れなければ drop 」。
+                        let permit = match conn_sem.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::warn!(
+                                    cap = MAX_IN_FLIGHT_CONNECTIONS,
+                                    "connection cap exceeded; dropping new connection"
+                                );
+                                drop(stream); // close immediately
+                                continue;
+                            }
+                        };
                         let d = dispatcher.clone();
                         tokio::spawn(async move {
+                            let _permit = permit; // hold for lifetime of this task
                             if let Err(e) = handle_one(stream, d).await {
                                 tracing::warn!("rpc handler error: {e:#}");
                             }
@@ -244,12 +275,26 @@ async fn handle_one(stream: UnixStream, dispatcher: Arc<dyn DynDispatcher>) -> R
     let (rx, mut tx) = stream.into_split();
     let mut reader = BufReader::new(rx);
     let mut line = String::new();
+
+    // read 全体に CONNECTION_READ_TIMEOUT を被せる (= newline を送らない client
+    // による fd / task 蓄積を防ぐ、 Phase 3 review M2)。
     // 上限 MAX_REQUEST_BYTES + 1 まで読み (= 超過なら request too large)。
-    let mut limited = (&mut reader).take(MAX_REQUEST_BYTES as u64 + 1);
-    let n = limited
-        .read_line(&mut line)
-        .await
-        .context("read RPC line")?;
+    let read_fut = async {
+        let mut limited = (&mut reader).take(MAX_REQUEST_BYTES as u64 + 1);
+        limited.read_line(&mut line).await
+    };
+    let n = match tokio::time::timeout(CONNECTION_READ_TIMEOUT, read_fut).await {
+        Ok(r) => r.context("read RPC line")?,
+        Err(_) => {
+            // timeout: best-effort で error response を送り、 connection close
+            let resp = RpcResponse::err(format!(
+                "request read timed out after {}s",
+                CONNECTION_READ_TIMEOUT.as_secs()
+            ));
+            let _ = send_response(&mut tx, &resp).await;
+            return Ok(());
+        }
+    };
     if n == 0 {
         return Ok(()); // EOF (= client が即切断)
     }
@@ -449,5 +494,103 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock = tmp.path().join("nothing.sock");
         assert!(!probe_existing_socket(&sock).await);
+    }
+
+    #[test]
+    fn connection_timeout_and_cap_constants() {
+        assert_eq!(CONNECTION_READ_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(MAX_IN_FLIGHT_CONNECTIONS, 32);
+    }
+
+    /// Phase 3 review M2: newline を送らない slow client は CONNECTION_READ_TIMEOUT
+    /// 後に error response を受け、 connection が close される。
+    /// (= virtual time + fresh socket でテスト)
+    #[tokio::test(start_paused = true)]
+    async fn slow_client_gets_read_timeout_error() {
+        let (_tmp, sock, lock) = fresh_paths("slow");
+        let h = bind_listener(&sock, &lock, Arc::new(EchoDispatcher))
+            .await
+            .unwrap();
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        // 部分 byte を送るが newline は送らない
+        stream.write_all(b"partial").await.unwrap();
+        stream.flush().await.unwrap();
+
+        // 仮想時間を timeout より先に進める
+        tokio::time::advance(CONNECTION_READ_TIMEOUT + Duration::from_secs(1)).await;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let resp: RpcResponse = serde_json::from_str(line.trim()).unwrap();
+        assert!(resp.error.as_deref().unwrap().contains("timed out"));
+
+        h.shutdown().await.unwrap();
+    }
+
+    /// Phase 3 review M2: connection cap 超過時、 新規 connection は accept 直後
+    /// drop され、 client 側は read で EOF を観測する。
+    ///
+    /// この test 用に slow dispatcher を使い、 既存 connection を 32 個 hold
+    /// した状態で 33 個目を打つ。
+    #[tokio::test(start_paused = true)]
+    async fn connection_cap_drops_extra_connections() {
+        // 永遠に block する dispatcher (= test 用)
+        struct HangDispatcher;
+        impl DynDispatcher for HangDispatcher {
+            fn dispatch<'a>(
+                &'a self,
+                _req: RpcRequest,
+            ) -> Pin<Box<dyn std::future::Future<Output = RpcResponse> + Send + 'a>> {
+                Box::pin(async move {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                })
+            }
+        }
+
+        let (_tmp, sock, lock) = fresh_paths("capdrop");
+        let h = bind_listener(&sock, &lock, Arc::new(HangDispatcher))
+            .await
+            .unwrap();
+
+        // MAX_IN_FLIGHT_CONNECTIONS 個の連接を hold (= dispatch で hang)
+        let mut held = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_CONNECTIONS {
+            let mut s = UnixStream::connect(&sock).await.unwrap();
+            s.write_all(b"{\"method\":\"sync.x\"}\n").await.unwrap();
+            s.flush().await.unwrap();
+            held.push(s);
+        }
+
+        // accept_loop が permit を hand off するのを待つ。 ここで時間を少し進める。
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+
+        // 33 個目: accept 直後 stream は drop される (= read で EOF)
+        let mut extra = UnixStream::connect(&sock).await.unwrap();
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+
+        let mut buf = [0u8; 1];
+        let n = match tokio::time::timeout(
+            Duration::from_secs(1),
+            extra.read(&mut buf),
+        )
+        .await
+        {
+            Ok(r) => r.unwrap_or(0),
+            Err(_) => {
+                tokio::time::advance(Duration::from_secs(2)).await;
+                tokio::task::yield_now().await;
+                extra.read(&mut buf).await.unwrap_or(0)
+            }
+        };
+        assert_eq!(n, 0, "extra connection should be closed (EOF)");
+
+        // hold 中の connection を drop して permit を返す
+        drop(held);
+        h.shutdown().await.unwrap();
     }
 }

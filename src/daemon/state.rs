@@ -76,6 +76,35 @@ impl RuntimeStatus {
     }
 }
 
+/// runtime_status + gossip_sender を **一体管理** する内部 state。
+///
+/// invariant (= Phase 3 review M3):
+/// - `RuntimeStatus::Active`           ⇔ `gossip_sender: Some(_)`
+/// - `RuntimeStatus::Uninitialized`     ⇔ `gossip_sender: None`
+/// - `RuntimeStatus::InitializedButNotSubscribed` ⇔ `gossip_sender: None`
+///
+/// この invariant を constructor / setter で型 level + 1 lock 内で保証する。
+/// 個別 setter (= 旧 set_runtime_status / set_gossip_sender) は廃止し、
+/// 「 状態 transition の意味 」 を表す method 経由のみ受け付ける。
+#[derive(Debug)]
+struct GossipRuntimeInner {
+    status: RuntimeStatus,
+    sender: Option<GossipSender>,
+}
+
+impl GossipRuntimeInner {
+    fn assert_invariant(&self) {
+        let expected_some = matches!(self.status, RuntimeStatus::Active);
+        debug_assert_eq!(
+            self.sender.is_some(),
+            expected_some,
+            "RuntimeStatus = {:?} but gossip_sender.is_some() = {}",
+            self.status,
+            self.sender.is_some()
+        );
+    }
+}
+
 /// daemon 全体で共有する state。
 ///
 /// **Clone 不可** (= per-process singleton)。 RPC handler には `Arc<DaemonState>`
@@ -89,22 +118,17 @@ pub struct DaemonState {
 
     /// 自分の EndpointId (= `endpoint.id()` のキャッシュ、 RPC で頻繁に返すため)。
     pub self_endpoint_id: EndpointId,
-    /// iroh stack 本体。 RPC 経路では `endpoint()` で参照、 send / receive loop
-    /// では Cloned して持つ。
+    /// iroh stack 本体。
     pub endpoint: Endpoint,
     /// blob store。 send_file / handle_upsert から共有。
     pub blobs: BlobsProtocol,
-    /// gossip send 半分。 None = 未 subscribe (= group_initialized = false)。
-    /// `Arc<Mutex<Option<...>>>` にすることで invite/accept 後の subscribe で
-    /// 後から差し込める (= daemon を再起動せずに済むかは Phase 3+ 検討)。
-    pub gossip_sender: Arc<Mutex<Option<GossipSender>>>,
 
-    /// 現在の runtime 状態 (Uninitialized / InitializedButNotSubscribed / Active)。
-    /// `gossip_sender.is_some()` だけだと「 起動時に subscribe したかどうか 」 が
-    /// 残らないので、 enum で意図を明示する。
-    pub runtime_status: Arc<Mutex<RuntimeStatus>>,
+    /// runtime_status と gossip_sender を一体管理 (= 不整合 invariant 防止)。
+    /// 直接 access はできず、 `current_runtime_status` / `enter_active` 等の
+    /// transition method 経由のみ。
+    gossip_runtime: Arc<Mutex<GossipRuntimeInner>>,
 
-    /// uptime 計算用。 `Instant::now() - start_instant` を `as_secs` する。
+    /// uptime 計算用。
     pub start_instant: Instant,
     /// peer → 直近 data-plane 成立 epoch 秒。
     pub last_seen_at: LastSeenMap,
@@ -113,6 +137,9 @@ pub struct DaemonState {
 impl DaemonState {
     /// 全 field を渡して構築する。 caller (= daemon main) が iroh stack を
     /// 組み立てた後で 1 度だけ呼ぶ想定。
+    ///
+    /// `runtime_status` と `gossip_sender` の組合せは invariant を満たす必要が
+    /// あり、 違反すると panic する (= caller の bug)。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         paths: DaemonPaths,
@@ -125,6 +152,20 @@ impl DaemonState {
         runtime_status: RuntimeStatus,
     ) -> Self {
         let self_endpoint_id = endpoint.id();
+        let inner = GossipRuntimeInner {
+            status: runtime_status,
+            sender: gossip_sender,
+        };
+        // 構築時 invariant を panic で検査 (= test debug build + release の両方で守る)
+        let expected_some = matches!(inner.status, RuntimeStatus::Active);
+        assert_eq!(
+            inner.sender.is_some(),
+            expected_some,
+            "DaemonState::new invariant violation: RuntimeStatus = {:?} requires \
+             gossip_sender.is_some() = {expected_some}, but got is_some() = {}",
+            inner.status,
+            inner.sender.is_some()
+        );
         Self {
             paths,
             allowlist,
@@ -133,8 +174,7 @@ impl DaemonState {
             self_endpoint_id,
             endpoint,
             blobs,
-            gossip_sender: Arc::new(Mutex::new(gossip_sender)),
-            runtime_status: Arc::new(Mutex::new(runtime_status)),
+            gossip_runtime: Arc::new(Mutex::new(inner)),
             start_instant: Instant::now(),
             last_seen_at: Arc::new(Mutex::new(Default::default())),
         }
@@ -149,7 +189,6 @@ impl DaemonState {
     /// 書込 / tombstone 適用成功時、 send 側で blob serve 完了時に呼ぶ。
     pub fn mark_peer_seen(&self, peer: EndpointId, now_epoch_secs: i64) {
         let mut g = self.last_seen_at.lock().expect("last_seen lock");
-        // 値を monotonically increase に (= 古い event が後から来ても巻き戻さない)
         let cur = g.get(&peer).copied().unwrap_or(0);
         if now_epoch_secs > cur {
             g.insert(peer, now_epoch_secs);
@@ -158,19 +197,44 @@ impl DaemonState {
 
     /// 現在の runtime_status を read-only で参照 (lock を握って Copy で返す)。
     pub fn current_runtime_status(&self) -> RuntimeStatus {
-        *self.runtime_status.lock().expect("runtime_status lock")
+        let g = self.gossip_runtime.lock().expect("gossip_runtime lock");
+        g.status
     }
 
-    /// runtime_status を更新 (= invite / accept 経路で folder_secret を adopt
-    /// した後 `InitializedButNotSubscribed` に上げる、 daemon 起動時に gossip
-    /// subscribe したら `Active` に上げる)。
-    pub fn set_runtime_status(&self, new: RuntimeStatus) {
-        *self.runtime_status.lock().expect("runtime_status lock") = new;
+    /// folder_secret を adopt したが gossip 未 subscribe な状態に遷移。
+    /// invite / accept-invite 経路で呼ぶ (= restart_required = true の根拠)。
+    /// gossip_sender は None のまま (= 起動時 subscribe してなかったので Some
+    /// であるはずがない、 ただし冪等性のため明示的に None にする)。
+    pub fn enter_initialized_but_not_subscribed(&self) {
+        let mut g = self.gossip_runtime.lock().expect("gossip_runtime lock");
+        g.status = RuntimeStatus::InitializedButNotSubscribed;
+        g.sender = None;
+        g.assert_invariant();
     }
 
-    /// gossip_sender を後から差し込む (= invite/accept で adopt 後の subscribe)。
-    pub fn set_gossip_sender(&self, sender: Option<GossipSender>) {
-        *self.gossip_sender.lock().expect("gossip_sender lock") = sender;
+    /// gossip subscribe 完了で Active 状態に遷移。 sender は必須引数 (= None
+    /// での Active は invariant 違反なので型 level で防ぐ)。
+    pub fn enter_active(&self, sender: GossipSender) {
+        let mut g = self.gossip_runtime.lock().expect("gossip_runtime lock");
+        g.status = RuntimeStatus::Active;
+        g.sender = Some(sender);
+        g.assert_invariant();
+    }
+
+    /// 強制 Uninitialized 化 (= folder-secret.bin 手動削除後の reset 用)。
+    /// テスト用 helper でもある。
+    pub fn enter_uninitialized(&self) {
+        let mut g = self.gossip_runtime.lock().expect("gossip_runtime lock");
+        g.status = RuntimeStatus::Uninitialized;
+        g.sender = None;
+        g.assert_invariant();
+    }
+
+    /// `gossip_sender` の clone を返す (= broadcast / Tombstone 送信用)。
+    /// Active 以外なら None。
+    pub fn gossip_sender_cloned(&self) -> Option<GossipSender> {
+        let g = self.gossip_runtime.lock().expect("gossip_runtime lock");
+        g.sender.clone()
     }
 }
 
@@ -266,10 +330,53 @@ mod tests {
         let seen = st.last_seen_at.lock().unwrap().get(&p).copied();
         assert_eq!(seen, Some(100));
 
-        st.set_runtime_status(RuntimeStatus::InitializedButNotSubscribed);
+        st.enter_initialized_but_not_subscribed();
         assert!(st.current_runtime_status().restart_required());
+        assert!(st.gossip_sender_cloned().is_none(), "Initialized は sender None");
 
         rt.shutdown().await.unwrap();
+    }
+
+    /// Phase 3 review M3: status と sender の invariant 違反は constructor で panic。
+    #[tokio::test]
+    #[should_panic(expected = "invariant violation")]
+    async fn daemon_state_new_panics_on_active_without_sender() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let watch_tmp = tempfile::TempDir::new().unwrap();
+        let watched = watch_tmp.path().canonicalize().unwrap();
+        let paths = fixture_paths(tmp.path(), &watched);
+
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[0x99; 32]))
+            .bind()
+            .await
+            .unwrap();
+        let allowlist = Arc::new(AllowList::empty_strict());
+        let pending = Arc::new(PendingTracker {
+            pending_root: tmp.path().join("pending"),
+            repo_hash: compute_repo_hash(&watched),
+        });
+        std::fs::create_dir_all(&pending.pending_root).unwrap();
+        let mut rt = SyncRuntime::build(
+            endpoint.clone(),
+            &paths.blobs_dir,
+            allowlist.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let _ = rt.take_topic();
+        // Active + sender=None は invariant 違反で panic するはず
+        DaemonState::new(
+            paths,
+            allowlist,
+            pending,
+            SyncState::new(),
+            rt.endpoint().clone(),
+            rt.blobs().clone(),
+            None,
+            RuntimeStatus::Active,
+        );
     }
 
     #[test]

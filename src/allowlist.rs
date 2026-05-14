@@ -44,9 +44,20 @@ struct AllowListJson {
 }
 
 /// peer allowlist。interior mutability で `&self` から add/remove を許す。
+///
+/// 2 段 lock 構造 (= Phase 3 review H1):
+/// - `inner`: state 本体。 contains / list 等の read は inner だけ握る (= 並行 read OK)
+/// - `persist_lock`: snapshot 作成 + disk write の **全区間** を直列化する
+///   barrier。 add_and_save / remove_and_save / save は最初に persist_lock を
+///   取り、 disk write 完了まで握る。 これで 2 つの concurrent writer が
+///   「 古い snapshot を後から書く 」 lost-update を防ぐ。
+///
+/// `contains` 等の reader は persist_lock を取らないので、 write 中も blocking
+/// なく current state を読める。
 #[derive(Debug)]
 pub struct AllowList {
     inner: Mutex<AllowListInner>,
+    persist_lock: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -63,6 +74,7 @@ impl AllowList {
                 open_all: false,
                 peers: HashMap::new(),
             }),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -73,6 +85,7 @@ impl AllowList {
                 open_all: true,
                 peers: HashMap::new(),
             }),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -106,6 +119,7 @@ impl AllowList {
                 open_all: j.open_all,
                 peers,
             }),
+            persist_lock: Mutex::new(()),
         })
     }
 
@@ -160,7 +174,9 @@ impl AllowList {
     }
 
     /// atomic save (tempfile + rename) + 0o600。
+    /// persist_lock を握り disk write 完了まで保持 (= 並行 save の serialize)。
     pub fn save(&self, path: &Path) -> Result<()> {
+        let _persist_guard = self.persist_lock.lock().expect("persist_lock poisoned");
         let bytes = {
             let g = self.inner.lock().expect("lock");
             Self::snapshot_json_bytes(&g)?
@@ -168,14 +184,19 @@ impl AllowList {
         write_atomic_0o600(path, &bytes)
     }
 
-    /// add + save を atomic に。**全部単一 lock 区間** (= 並行 add の値を save に
-    /// 含めるか、失敗時にきれいに rollback するため)。save 失敗時は in-memory も
-    /// **完全 previous state** に戻す (= Phase 2 review Medium 3)。
+    /// add + save を atomic に。
     ///
-    /// previous state には以下 2 つが含まれる:
+    /// **persist_lock を最初に取り、 disk write 完了まで保持する** (= Phase 3
+    /// review H1)。 これで concurrent writer の lost-update を防ぐ:
+    /// T1 が snapshot A → write A の途中、 T2 が persist_lock 待ち、 T1 write
+    /// 完了 → T2 が snapshot B (= A の変更を含む) → write B、 という直列化。
+    ///
+    /// save 失敗時は in-memory も **完全 previous state** に戻す (= Phase 2 M3)。
+    /// previous state:
     /// - `prev_open_all`: 元 open_all flag。open_all → strict 遷移時 失敗で元に戻す
     /// - `prev_info`: 元 PeerInfo (= 既存 peer 更新時)。 None なら新規 add
     pub fn add_and_save(&self, id: EndpointId, info: PeerInfo, path: &Path) -> Result<()> {
+        let _persist_guard = self.persist_lock.lock().expect("persist_lock poisoned");
         let (bytes, prev_open_all, prev_info) = {
             let mut g = self.inner.lock().expect("lock");
             let prev_open_all = g.open_all;
@@ -184,7 +205,6 @@ impl AllowList {
             match Self::snapshot_json_bytes(&g) {
                 Ok(b) => (b, prev_open_all, prev_info),
                 Err(e) => {
-                    // serialize 失敗の rollback: open_all / peers を完全復元
                     g.open_all = prev_open_all;
                     match prev_info {
                         Some(old) => {
@@ -197,13 +217,9 @@ impl AllowList {
                     return Err(e);
                 }
             }
-            // ★ ここで lock を release してから IO (= persist) に入る
         };
         if let Err(e) = write_atomic_0o600(path, &bytes) {
-            // persist 失敗時の rollback: open_all と peer 両方を元に戻す。
-            // 並行 add で別 thread が同 id を被せている可能性は無視し、
-            // とにかく **save 時点の previous state** を権威とする
-            // (= 並行 caller も同じ persist 失敗を観測し各自 rollback する想定)。
+            // persist 失敗時の rollback: persist_lock は依然 hold (= 直列化下)。
             let mut g = self.inner.lock().expect("lock");
             g.open_all = prev_open_all;
             match prev_info {
@@ -220,7 +236,9 @@ impl AllowList {
     }
 
     /// remove + save を atomic に。 save 失敗時は元の PeerInfo を復元。
+    /// persist_lock で `add_and_save` / `save` と直列化される (= Phase 3 review H1)。
     pub fn remove_and_save(&self, id: &EndpointId, path: &Path) -> Result<Option<PeerInfo>> {
+        let _persist_guard = self.persist_lock.lock().expect("persist_lock poisoned");
         let (prev, bytes) = {
             let mut g = self.inner.lock().expect("lock");
             let prev = g.peers.remove(id);
@@ -235,7 +253,6 @@ impl AllowList {
             }
         };
         if let Err(e) = write_atomic_0o600(path, &bytes) {
-            // rollback
             if let Some(old) = prev {
                 self.inner.lock().expect("lock").peers.insert(*id, old);
             }
@@ -272,6 +289,7 @@ fn write_atomic_0o600(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn fixture_id(byte: u8) -> EndpointId {
@@ -457,5 +475,92 @@ mod tests {
         let found = entries.iter().find(|(eid, _)| *eid == id).unwrap();
         assert_eq!(found.1.label.as_deref(), Some("original"));
         assert_eq!(found.1.added_at, 100);
+    }
+
+    /// Phase 3 review H1: 並行 add_and_save が **lost update なし** で disk に
+    /// 反映される。 persist_lock を最初に取り、 disk write 完了まで保持する
+    /// 設計により、 同時 caller は直列化される。
+    #[test]
+    fn add_and_save_serializes_concurrent_writers() {
+        use std::thread;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("allowlist.json");
+        let a = Arc::new(AllowList::empty_strict());
+
+        let n = 20;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let a = a.clone();
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                a.add_and_save(
+                    fixture_id(i as u8),
+                    PeerInfo::new(Some(format!("peer{i}")), i as i64),
+                    &path,
+                )
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // disk と in-memory の両方で n entries 全部残っている (= lost update なし)
+        let from_disk = AllowList::load_or_strict_empty(&path).unwrap();
+        assert_eq!(from_disk.list().len(), n, "disk must contain all {n} peers");
+        assert_eq!(a.list().len(), n, "in-memory must contain all {n} peers");
+    }
+
+    /// add_and_save と remove_and_save の並行も直列化されることを確認 (= 同
+    /// persist_lock を共有)。
+    #[test]
+    fn add_and_remove_serialize_via_same_persist_lock() {
+        use std::thread;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("allowlist.json");
+        let a = Arc::new(AllowList::empty_strict());
+
+        // seed
+        for i in 0..10 {
+            a.add_and_save(
+                fixture_id(i),
+                PeerInfo::new(None, i as i64),
+                &path,
+            )
+            .unwrap();
+        }
+
+        // 並行に 10 つの add + 10 つの remove を打つ
+        let mut handles = Vec::new();
+        for i in 10..20 {
+            let a = a.clone();
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                a.add_and_save(fixture_id(i), PeerInfo::new(None, i as i64), &path)
+                    .unwrap();
+            }));
+        }
+        for i in 0..10 {
+            let a = a.clone();
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                a.remove_and_save(&fixture_id(i), &path).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // disk = in-memory が一致 (= 直列化 + 全 update が反映)
+        let from_disk = AllowList::load_or_strict_empty(&path).unwrap();
+        let mem_ids: std::collections::BTreeSet<_> =
+            a.list().into_iter().map(|(id, _)| id).collect();
+        let disk_ids: std::collections::BTreeSet<_> =
+            from_disk.list().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(mem_ids, disk_ids);
+        // 期待 set = fixture_id(10..20)
+        let expected: std::collections::BTreeSet<_> =
+            (10u8..20).map(fixture_id).collect();
+        assert_eq!(mem_ids, expected);
     }
 }
