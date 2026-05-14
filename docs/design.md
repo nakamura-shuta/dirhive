@@ -502,9 +502,11 @@ signal 受信
 <key>KeepAlive</key> <true/>
 <key>ExitTimeOut</key> <integer>15</integer>      <!-- daemon の 10s budget より長く -->
 <key>ThrottleInterval</key> <integer>10</integer>  <!-- crash loop 抑止 -->
-<key>StandardOutPath</key> <string>~/Library/Logs/p2p-dir-sync.log</string>
-<key>StandardErrorPath</key> <string>~/Library/Logs/p2p-dir-sync.log</string>
+<key>StandardOutPath</key> <string>~/Library/Logs/p2p-dir-sync.stdout.log</string>
+<key>StandardErrorPath</key> <string>~/Library/Logs/p2p-dir-sync.stderr.log</string>
 ```
+
+**StandardOutPath / StandardErrorPath は daemon 本体の log file (= `~/Library/Logs/p2p-dir-sync.log`) と別 path にする** (= `*.stdout.log` / `*.stderr.log` で suffix を分ける)。理由: daemon 本体が `init_tracing` で `p2p-dir-sync.log` に file appender を張っているので、launchd の stderr redirect 先が同じ file になると同じ行が 2 回書かれる。 `sync.recent-log` が tail するのは daemon の file appender 出力 (= `p2p-dir-sync.log`) のみ。 launchd 側の 2 file は launchd プロセス管理の crash diagnostics 用と位置付ける。
 
 `launchctl bootout` → SIGTERM → graceful 10s → exit 0。15s 超過時は launchd が SIGKILL → 不変条件で安全終了。`KeepAlive=true` で異常終了時 10s 後に auto restart。
 

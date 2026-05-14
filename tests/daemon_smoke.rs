@@ -120,3 +120,78 @@ async fn daemon_invite_first_call_sets_restart_required() {
     }
     let _ = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
 }
+
+/// 2nd-round M3 review fix: daemon 直起動 (launchd 経由でない) でも `init_tracing`
+/// の file appender が log file に出力し、 sync.recent-log が tail できることを
+/// e2e で確認する (= 旧 smoke は人工 file の tail/redact しか検証していなかった)。
+#[tokio::test]
+#[ignore = "spawns daemon binary; requires N0 relay reachability"]
+async fn daemon_recent_log_reads_actual_file_appender_output() {
+    let watch_tmp = tempfile::TempDir::new().unwrap();
+    let state_tmp = tempfile::TempDir::new().unwrap();
+    let mut child = {
+        let bin = env!("CARGO_BIN_EXE_p2p-sync");
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.arg("--watch")
+            .arg(watch_tmp.path())
+            .env("P2P_SYNC_STATE_DIR", state_tmp.path())
+            .env("P2P_SYNC_CONFIG_DIR", state_tmp.path().join("config"))
+            .env("P2P_SYNC_LOG_DIR", state_tmp.path().join("logs"))
+            // 「 endpoint online 」 等の info ログを確実に file に流すため
+            .env("P2P_SYNC_LOG", "info,p2p_dir_sync=debug")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        cmd.spawn().expect("spawn p2p-sync")
+    };
+
+    let socket = state_tmp.path().join("daemon.sock");
+    // wait until ready (~15s)
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if socket.exists()
+            && rpc(&socket, "sync.health-check", serde_json::json!({}))
+                .await
+                .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(socket.exists(), "daemon did not become ready");
+
+    // log file の場所を解決して中身を直接 read してみる (= file appender 動作確認)
+    let log_path = state_tmp.path().join("logs").join("p2p-dir-sync.log");
+    assert!(
+        log_path.exists(),
+        "init_tracing file appender did not create log file at {}",
+        log_path.display()
+    );
+    let on_disk = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        on_disk.contains("endpoint online") || on_disk.contains("daemon listening"),
+        "log file should contain startup messages, got: {on_disk:.500}"
+    );
+
+    // sync.recent-log RPC でも同じ内容が読める (= dispatch 経由)
+    let v = rpc(&socket, "sync.recent-log", serde_json::json!({"lines": 50}))
+        .await
+        .expect("recent-log rpc");
+    let lines = v["lines"].as_array().expect("lines array");
+    let joined = lines
+        .iter()
+        .filter_map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("endpoint online") || joined.contains("daemon listening"),
+        "sync.recent-log should surface startup messages from file appender"
+    );
+
+    let pid = child.id().unwrap() as i32;
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
+}
