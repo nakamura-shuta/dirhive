@@ -47,6 +47,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [dev-dependencies]
+libc = "0.2"
 serial_test = "3"
 
 [[bin]]

@@ -2856,6 +2856,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-gossip",
  "iroh-tickets",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "rand",
