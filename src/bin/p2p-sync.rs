@@ -32,9 +32,13 @@ use p2p_dir_sync::daemon::listener::{
 };
 use p2p_dir_sync::daemon::state::{DaemonPaths, DaemonState, RuntimeStatus};
 use p2p_dir_sync::keystore;
+use p2p_dir_sync::message::PeerRef;
 use p2p_dir_sync::paths;
+use p2p_dir_sync::receive::{PeerSeenCallback, receive_loop};
 use p2p_dir_sync::runtime::SyncRuntime;
+use p2p_dir_sync::send::{broadcast_tombstone, send_file};
 use p2p_dir_sync::state::{PendingTracker, SyncState};
+use p2p_dir_sync::watcher::{WatcherBackend, spawn_watcher, watcher_loop};
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -136,19 +140,17 @@ async fn main() -> Result<()> {
     .await
     .context("SyncRuntime::build")?;
 
-    // (12) DaemonState 構築
-    let (gossip_sender_opt, runtime_status) = match folder_secret {
+    // (12) DaemonState 構築 + topic split (sender → DaemonState、 receiver は後で
+    // receive_loop に渡す)。
+    let (gossip_sender_opt, gossip_receiver_opt, runtime_status) = match folder_secret {
         Some(_) => {
             let topic = sync_runtime
                 .take_topic()
                 .context("SyncRuntime::take_topic (group_initialized なのに None)")?;
             let (sender, receiver) = topic.split();
-            // receiver は Phase 3 後半で receive_loop に渡す予定 (= ここでは hold する)
-            // 一旦 leak で hold (= drop すると topic から leave してしまう)
-            std::mem::forget(receiver);
-            (Some(sender), RuntimeStatus::Active)
+            (Some(sender), Some(receiver), RuntimeStatus::Active)
         }
-        None => (None, RuntimeStatus::Uninitialized),
+        None => (None, None, RuntimeStatus::Uninitialized),
     };
 
     let pending = Arc::new(
@@ -180,12 +182,134 @@ async fn main() -> Result<()> {
         "daemon listening"
     );
 
-    // (14) Phase 3 後半で watcher + receive_loop を spawn する。
+    // (14) watcher + receive_loop spawn (= Phase 3 Step 3g)。
+    // group_initialized のとき (= gossip_receiver_opt が Some) のみ実行。
+    let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let Some(receiver) = gossip_receiver_opt {
+        // (14a) receive_loop: peer から SyncUpdate を受信 → local fs に適用
+        // mark_peer_seen callback で last_seen_at を更新 (= L4)
+        let state_for_cb = state.clone();
+        let peer_seen_cb: PeerSeenCallback =
+            std::sync::Arc::new(move |peer, t| state_for_cb.mark_peer_seen(peer, t));
+        let allowlist_for_recv = state.allowlist.clone();
+        let pending_for_recv = state.pending.clone();
+        let state_for_recv = state.sync_state.clone();
+        let watched_for_recv = watched_dir.clone();
+        let endpoint_for_recv = state.endpoint.clone();
+        let blobs_for_recv = state.blobs.clone();
+        bg_tasks.push(tokio::spawn(async move {
+            if let Err(e) = receive_loop(
+                receiver,
+                endpoint_for_recv,
+                blobs_for_recv,
+                allowlist_for_recv,
+                state_for_recv,
+                watched_for_recv,
+                pending_for_recv,
+                Some(peer_seen_cb),
+            )
+            .await
+            {
+                tracing::warn!("receive_loop exited with error: {e:#}");
+            }
+        }));
+
+        // (14b) watcher: fsnotify event → send_file / broadcast_tombstone
+        // gossip_sender は DaemonState 経由で clone (= invariant 上 Active なら Some)
+        let sender = state
+            .gossip_sender_cloned()
+            .context("gossip_sender must be Some when runtime_status = Active")?;
+        let (watcher_handle, watcher_rx) = spawn_watcher(&watched_dir, WatcherBackend::Recommended)
+            .context("spawn_watcher")?;
+        let watched_for_w = watched_dir.clone();
+        let state_for_w = state.clone();
+        let self_peer = PeerRef { id: state.self_endpoint_id };
+
+        bg_tasks.push(tokio::spawn(async move {
+            let _hold = watcher_handle; // drop で debouncer 停止
+            let _ = watcher_loop(watcher_rx, watched_for_w.clone(), |ev, rel| {
+                let watched = watched_for_w.clone();
+                let state = state_for_w.clone();
+                let sender = sender.clone();
+                let self_peer = self_peer.clone();
+                async move {
+                    // event kind が remove なら tombstone broadcast、 それ以外は send_file
+                    use notify_debouncer_full::notify::EventKind;
+                    let rel_str = match rel.to_str() {
+                        Some(s) => s.to_string(),
+                        None => {
+                            tracing::warn!("rel path not UTF-8: {}", rel.display());
+                            return;
+                        }
+                    };
+                    let abs_target = watched.join(&rel);
+                    if matches!(ev.event.kind, EventKind::Remove(_)) || !abs_target.exists() {
+                        // self-loop 防止: last_removed に入っているなら consume + skip
+                        let suppress = {
+                            let mut g = state.sync_state.last_removed.lock().expect("lock");
+                            g.remove(&rel)
+                        };
+                        if suppress {
+                            tracing::debug!(
+                                path = %rel_str,
+                                "watcher Remove suppressed (= self-loop from receive)"
+                            );
+                            return;
+                        }
+                        if let Err(e) =
+                            broadcast_tombstone(&rel_str, &sender, self_peer, &state.sync_state)
+                                .await
+                        {
+                            tracing::warn!(path = %rel_str, "broadcast_tombstone failed: {e:#}");
+                        }
+                    } else {
+                        // last_written に同 hash がある = receive で書いた直後 → skip
+                        let suppress_hash = {
+                            let last = state.sync_state.last_written.lock().expect("lock");
+                            last.get(&rel).copied()
+                        };
+                        if let Some(_h) = suppress_hash {
+                            // hash 比較は send_file 側でも行うが、 watcher 段で
+                            // shortcut できる (= 連続 event の skip)
+                            tracing::trace!(
+                                path = %rel_str,
+                                "watcher Modify shortcut (last_written hit)"
+                            );
+                        }
+                        if let Err(e) = send_file(
+                            &rel_str,
+                            &watched,
+                            &state.blobs,
+                            &sender,
+                            self_peer,
+                            &state.sync_state,
+                        )
+                        .await
+                        {
+                            tracing::warn!(path = %rel_str, "send_file failed: {e:#}");
+                        }
+                    }
+                }
+            })
+            .await;
+        }));
+    } else {
+        tracing::info!(
+            "daemon started uninitialized (folder_secret absent). \
+             Call sync.invite or sync.accept-invite then restart to join mesh."
+        );
+    }
 
     // (15) SIGINT / SIGTERM 待機 → graceful shutdown
     wait_for_shutdown_signal().await?;
     tracing::info!("shutdown signal received");
     listener_handle.shutdown().await.context("listener shutdown")?;
+    // bg_tasks (watcher / receive_loop) は abort して exit を急ぐ。
+    // 個別 spawn の future が drop されると notify debouncer / gossip receiver が
+    // 内部 cancellation で停止する。
+    for t in bg_tasks {
+        t.abort();
+    }
     sync_runtime
         .shutdown()
         .await
