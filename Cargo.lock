@@ -2851,6 +2851,7 @@ dependencies = [
  "iroh-tickets",
  "notify",
  "notify-debouncer-full",
+ "rand",
  "rmcp",
  "schemars",
  "serde",

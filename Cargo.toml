@@ -33,6 +33,7 @@ iroh-gossip = "0.99.0"
 iroh-tickets = "1.0.0-rc.0"
 notify = "8.2.0"
 notify-debouncer-full = "0.7"
+rand = "0.10"
 # MCP server framework (= bin/p2p-sync-mcp.rs)
 rmcp = { version = "1.7", features = ["transport-io"] }
 schemars = "1"
