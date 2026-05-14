@@ -170,19 +170,23 @@ impl AllowList {
 
     /// add + save を atomic に。**全部単一 lock 区間** (= 並行 add の値を save に
     /// 含めるか、失敗時にきれいに rollback するため)。save 失敗時は in-memory も
-    /// 元に戻す。
+    /// **完全 previous state** に戻す (= Phase 2 review Medium 3)。
+    ///
+    /// previous state には以下 2 つが含まれる:
+    /// - `prev_open_all`: 元 open_all flag。open_all → strict 遷移時 失敗で元に戻す
+    /// - `prev_info`: 元 PeerInfo (= 既存 peer 更新時)。 None なら新規 add
     pub fn add_and_save(&self, id: EndpointId, info: PeerInfo, path: &Path) -> Result<()> {
-        let bytes = {
+        let (bytes, prev_open_all, prev_info) = {
             let mut g = self.inner.lock().expect("lock");
             let prev_open_all = g.open_all;
-            let prev = g.peers.insert(id, info);
+            let prev_info = g.peers.insert(id, info);
             g.open_all = false;
             match Self::snapshot_json_bytes(&g) {
-                Ok(b) => b,
+                Ok(b) => (b, prev_open_all, prev_info),
                 Err(e) => {
-                    // rollback (snapshot serialization 失敗は通常起きないが念のため)
+                    // serialize 失敗の rollback: open_all / peers を完全復元
                     g.open_all = prev_open_all;
-                    match prev {
+                    match prev_info {
                         Some(old) => {
                             g.peers.insert(id, old);
                         }
@@ -196,19 +200,26 @@ impl AllowList {
             // ★ ここで lock を release してから IO (= persist) に入る
         };
         if let Err(e) = write_atomic_0o600(path, &bytes) {
-            // persist 失敗時の rollback: 並行 mutation が後から乗っている可能性が
-            // あるので、見つけた値 == 自分が書いた値 のときだけ取り除く
+            // persist 失敗時の rollback: open_all と peer 両方を元に戻す。
+            // 並行 add で別 thread が同 id を被せている可能性は無視し、
+            // とにかく **save 時点の previous state** を権威とする
+            // (= 並行 caller も同じ persist 失敗を観測し各自 rollback する想定)。
             let mut g = self.inner.lock().expect("lock");
-            if g.peers.get(&id).map(|v| v.added_at) == Some(g.peers.get(&id).map(|v| v.added_at).unwrap_or_default()) {
-                // 単純化: いずれにせよ remove する (= 並行 mutation が乗っていたら別 entry なので別問題)
-                let _ = g.peers.remove(&id);
+            g.open_all = prev_open_all;
+            match prev_info {
+                Some(old) => {
+                    g.peers.insert(id, old);
+                }
+                None => {
+                    g.peers.remove(&id);
+                }
             }
             return Err(e);
         }
         Ok(())
     }
 
-    /// remove + save を atomic に。
+    /// remove + save を atomic に。 save 失敗時は元の PeerInfo を復元。
     pub fn remove_and_save(&self, id: &EndpointId, path: &Path) -> Result<Option<PeerInfo>> {
         let (prev, bytes) = {
             let mut g = self.inner.lock().expect("lock");
@@ -392,5 +403,59 @@ mod tests {
         a.save(&path).unwrap();
         let b = AllowList::load_or_strict_empty(&path).unwrap();
         assert!(b.is_open_all());
+    }
+
+    /// Medium 3 review fix: persist 失敗時に open_all が strict に落ちたまま
+    /// 残らない (= 元の state に戻る)。
+    #[test]
+    fn add_and_save_rollback_restores_open_all_on_persist_failure() {
+        let a = AllowList::open_all();
+        assert!(a.is_open_all());
+
+        // 不正な path = parent dir として regular file を渡し、 tempfile_in を失敗させる。
+        let tmp = TempDir::new().unwrap();
+        let regular_file = tmp.path().join("not_a_dir");
+        std::fs::write(&regular_file, b"x").unwrap();
+        let bad_path = regular_file.join("allowlist.json");
+
+        let _err = a
+            .add_and_save(fixture_id(9), PeerInfo::new(None, 0), &bad_path)
+            .unwrap_err();
+
+        // rollback: open_all が再度 true、 peers map に追加分が残らない
+        // (= contains は open_all true なら全 id true を返すので、 list 経由で確認)
+        assert!(a.is_open_all(), "open_all must be restored after persist failure");
+        assert!(
+            a.list().iter().all(|(id, _)| *id != fixture_id(9)),
+            "added peer must be removed from peers map"
+        );
+    }
+
+    /// Medium 3 review fix: persist 失敗時、 既存 peer の info が「 上書き前 」
+    /// に戻る (= 古い label / added_at が消えない)。
+    #[test]
+    fn add_and_save_rollback_restores_existing_peer_info() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("allowlist.json");
+        let a = AllowList::empty_strict();
+        let id = fixture_id(5);
+        // 既存 entry
+        a.add_and_save(id, PeerInfo::new(Some("original".into()), 100), &path)
+            .unwrap();
+
+        // 不正 path で update を試みる → persist 失敗
+        let regular_file = tmp.path().join("not_a_dir");
+        std::fs::write(&regular_file, b"x").unwrap();
+        let bad_path = regular_file.join("allowlist.json");
+
+        let _ = a
+            .add_and_save(id, PeerInfo::new(Some("changed".into()), 999), &bad_path)
+            .unwrap_err();
+
+        // rollback: 元の info に戻る
+        let entries = a.list();
+        let found = entries.iter().find(|(eid, _)| *eid == id).unwrap();
+        assert_eq!(found.1.label.as_deref(), Some("original"));
+        assert_eq!(found.1.added_at, 100);
     }
 }

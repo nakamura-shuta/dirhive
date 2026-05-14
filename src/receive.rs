@@ -13,6 +13,29 @@
 //! - size guard: blob 取得後の `tag.bytes > MAX_FILE_SIZE` は drop + warn
 //! - atomic write: sibling tempfile + persist (POSIX rename)
 //!
+//! ## 限界: gossip allowlist は **DoS layer**、 adversary layer ではない
+//!
+//! `update.from().id` は **payload 内の自己申告 field** で署名検証していない。
+//! folder_secret を知る peer は誰でも任意の `from.id` を名乗れる。 つまり:
+//!
+//! - mesh に居る未許可 peer が「 自分は許可済 peer 」 と詐称して Upsert / Tombstone
+//!   を broadcast 可能 (特に Tombstone は blob fetch を経由しないので削除まで通る)
+//!
+//! MVP では:
+//! 1. `folder_secret` を **「 mesh への入場券 」** として 1 つの信頼境界とみなす
+//! 2. folder_secret を知る peer は「 群れの一員 」 として既に信頼済の扱い
+//! 3. allowlist は「 既知 peer の管理 」 + 「 mesh に居るだけの未許可 peer から
+//!    の DoS / noise を落とす 」 ための運用 layer であって、 暗号学的な認証
+//!    境界ではない
+//!
+//! design §6.1 「 既に許可した peer が後で悪意ある change を流す経路 = 信頼境界、
+//! revoke で対応 」 と同じ整理。 真の adversary 耐性 (= folder_secret を漏らした
+//! peer が悪意化した状況) は Phase 3 以降で SyncUpdate に endpoint-key 署名を
+//! 追加することで対応する想定 (= 各 SyncUpdate を `from.id` の secret_key で
+//! 署名し、 受信側で公開鍵検証)。
+//!
+//! ## test 範囲
+//!
 //! 本 module は **fetch (= blob download)** の完全な path 統合は Phase 3 で
 //! 行う。 unit test で testable な範囲は dispatch policy + 個別 write/remove
 //! 経路。 blob fetch は 2-peer integration test で確認する想定。
@@ -181,7 +204,58 @@ pub async fn dispatch_update(
     }
 }
 
+/// `state.pending_written` への mark の RAII guard。
+///
+/// drop で entry を自動削除する。 `commit()` を呼ぶと drop 時の削除を skip
+/// する (= 成功 path で「 pending → last_written へ move 」 した直後に呼ぶ)。
+///
+/// Phase 2 review Medium 4 で導入: 旧 logic では blob fetch / conflict
+/// rename / mkdir / tempfile / persist の各 ? 経路で pending_written
+/// remove を呼び忘れ、 watcher が「 永遠に書込中扱い 」 で event を skip し続ける
+/// state leak が起きていた。 guard で全 error path を網羅。
+struct PendingWriteGuard<'a> {
+    state: &'a SyncState,
+    rel_path: PathBuf,
+    committed: bool,
+}
+
+impl<'a> PendingWriteGuard<'a> {
+    fn new(state: &'a SyncState, rel_path: &str, hash: Hash) -> Self {
+        state
+            .pending_written
+            .lock()
+            .expect("pending_written lock")
+            .insert(PathBuf::from(rel_path), hash);
+        Self {
+            state,
+            rel_path: PathBuf::from(rel_path),
+            committed: false,
+        }
+    }
+
+    /// 成功時に呼ぶ: drop 時の自動 remove を抑止する (= caller が明示的に
+    /// last_written に move する想定)。
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingWriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.state
+                .pending_written
+                .lock()
+                .expect("pending_written lock")
+                .remove(&self.rel_path);
+        }
+    }
+}
+
 /// Upsert を local に反映: blob fetch → size guard → conflict backup → atomic write。
+///
+/// `pending_written` mark は `PendingWriteGuard` で管理し、 全 error path で
+/// drop により自動 remove される (= state leak 防止)。
 ///
 /// (Endpoint + BlobsProtocol + state + dir + 識別子 4 つ) で arg は多めだが、
 /// blob fetch path がそれぞれ独立した依存なので bundle すると別 struct を
@@ -208,20 +282,12 @@ pub async fn handle_upsert(
         }
     };
 
-    // pending_written に mark しておく (= watcher 側で「同 hash 書込中」を区別)
-    state
-        .pending_written
-        .lock()
-        .expect("pending_written lock")
-        .insert(PathBuf::from(rel_path), hash);
+    // pending_written に mark (= watcher 側で「 同 hash 書込中 」 を区別)。
+    // guard が drop されるまでは全 error path で自動 remove される。
+    let guard = PendingWriteGuard::new(state, rel_path, hash);
 
     // blob fetch: local store に未保持なら source peer から download。
     if let Err(e) = ensure_blob_local(endpoint, blobs, from_id, hash, format).await {
-        state
-            .pending_written
-            .lock()
-            .expect("pending_written lock")
-            .remove(Path::new(rel_path));
         tracing::warn!(path = rel_path, "blob fetch failed: {e:#}");
         return Ok(ReceiveOutcome::Skipped {
             reason: "blob_fetch_failed",
@@ -232,11 +298,6 @@ pub async fn handle_upsert(
         .await
         .map_err(|e| anyhow!("blob size: {e}"))?;
     if size > MAX_FILE_SIZE {
-        state
-            .pending_written
-            .lock()
-            .expect("pending_written lock")
-            .remove(Path::new(rel_path));
         tracing::warn!(
             path = rel_path,
             size,
@@ -282,11 +343,14 @@ pub async fn handle_upsert(
     tmp.persist(&abs)
         .map_err(|e| anyhow!("persist {}: {}", abs.display(), e.error))?;
 
-    // pending_written → last_written に move
-    {
-        let mut pw = state.pending_written.lock().expect("pending_written lock");
-        pw.remove(Path::new(rel_path));
-    }
+    // ここまで来たら成功 = pending_written guard を commit (drop 時の自動 remove 停止)
+    // → 続いて手動で last_written に move する (= guard とは別の集合なので)
+    guard.commit();
+    state
+        .pending_written
+        .lock()
+        .expect("pending_written lock")
+        .remove(Path::new(rel_path));
     state
         .last_written
         .lock()
@@ -303,6 +367,15 @@ pub async fn handle_upsert(
 }
 
 /// Tombstone を local に反映: validate → last_removed mark → unlink。
+///
+/// `last_removed` mark の扱い (= Phase 2 review Medium 5):
+/// - **unlink 前** に mark する (= watcher が先に Remove event 拾った race
+///   でも skip 判定できるようにする)
+/// - unlink 成功 → mark をそのまま残す (= watcher の Remove event が来たら consume)
+/// - unlink 失敗 (= 任意 IO error) → marker 撤回 (= retry の余地を残す)
+/// - **`NotFound`** → marker 撤回 (= file が元から無いので watcher は Remove event
+///   を発火しない → marker を残すと「 後で同 path に正当な local delete が来た
+///   とき、 古い marker で skip される 」 stale state になる)
 pub async fn handle_tombstone(
     rel_path: &str,
     state: &SyncState,
@@ -318,9 +391,6 @@ pub async fn handle_tombstone(
         }
     };
 
-    // last_removed に先 mark: watcher の Remove event handler が self-loop で
-    // 再 broadcast しないように。 unlink の前後どちらでも race にならないよう、
-    // 「unlink 前に mark」 にする (= watcher が先に event 拾った場合も skip 判定可能)。
     state
         .last_removed
         .lock()
@@ -333,7 +403,17 @@ pub async fn handle_tombstone(
             Ok(ReceiveOutcome::Applied)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::debug!(path = rel_path, "tombstone but file already gone");
+            // file が元から無い: watcher は Remove event を発火しないので、
+            // marker を残しても consume されず stale 化する → 撤回する。
+            state
+                .last_removed
+                .lock()
+                .expect("last_removed lock")
+                .remove(Path::new(rel_path));
+            tracing::debug!(
+                path = rel_path,
+                "tombstone but file already gone; cleared marker"
+            );
             Ok(ReceiveOutcome::Applied)
         }
         Err(e) => {
@@ -532,6 +612,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, ReceiveOutcome::Applied);
+
+        // Medium 5 review fix: marker は撤回されている (= 後で正当な local delete
+        // が来たとき watcher が誤 skip しない)
+        assert!(
+            !state
+                .last_removed
+                .lock()
+                .unwrap()
+                .contains(Path::new("never.md")),
+            "marker must be cleared when file did not exist"
+        );
     }
 
     #[tokio::test]
@@ -548,6 +639,49 @@ mod tests {
                 reason: "unsafe_path"
             }
         );
+    }
+
+    /// Medium 4 review fix: blob fetch 失敗で early return しても、 pending_written
+    /// に entry が leak しない (= PendingWriteGuard の Drop が cleanup する)。
+    #[tokio::test]
+    async fn handle_upsert_clears_pending_written_on_fetch_failure() {
+        let (rt, _store_tmp) = build_minimal_runtime().await;
+        let watch_tmp = tempfile::TempDir::new().unwrap();
+        let watch_root = watch_tmp.path().canonicalize().unwrap();
+        let state = SyncState::new();
+
+        // 存在しない (= local 未保持) hash + 接続不可能 fake peer。
+        // ensure_blob_local が必ず失敗する → guard が drop で remove する。
+        let fake_hash = Hash::new(b"never-added");
+        let fake_peer = fixture_peer_id(0x99);
+
+        let outcome = handle_upsert(
+            "ghost.md",
+            fake_hash,
+            BlobFormat::Raw,
+            fake_peer,
+            rt.endpoint(),
+            rt.blobs(),
+            &state,
+            &watch_root,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ReceiveOutcome::Skipped { reason } if reason == "blob_fetch_failed"),
+            "expected fetch failure, got {outcome:?}"
+        );
+
+        // pending_written に「 書込中マーク 」 が leak していない
+        let leaked = {
+            let pw = state.pending_written.lock().unwrap();
+            pw.contains_key(Path::new("ghost.md"))
+        };
+        assert!(
+            !leaked,
+            "PendingWriteGuard must remove entry on early return"
+        );
+        rt.shutdown().await.unwrap();
     }
 
     #[tokio::test]

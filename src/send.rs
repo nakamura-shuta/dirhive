@@ -29,44 +29,81 @@ pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// `watched_dir` 配下の `rel_path` を canonical absolute path に解決する。
 ///
-/// symlink escape 防止: `rel_path` 配下の component が watched_dir を抜け出す
-/// 経路 (= `..`、 symlink で外部 dir を指す) を拒否する。 具体的には:
+/// symlink escape 防止: `rel_path` の各 component を `watched_dir` から順に
+/// `symlink_metadata` で覗き込み、 中間に **symlink が居れば即 reject**。
 ///
-/// 1. `validate_relative_path` で構文 check (caller 責務でもある)
-/// 2. 結合 path の parent を 1 段ずつ `symlink_metadata` で見て、 symlink が
-///    途中に居れば「外部参照かも」 として canonicalize で再確認、 結果が
-///    `watched_dir_canonical` の prefix でなければ reject
-/// 3. 最終 absolute path を `watched_dir.canonicalize()?.starts_with` で確認
+/// なぜ「 parent.exists() で canonicalize すれば足りる」 では不十分なのか:
+/// - `watched/link → /tmp/outside` が既存で、 受信 path = `link/new/file.md`
+///   の場合、 parent = `watched/link/new` は **不在** 扱い (= ENOENT) で
+///   canonicalize できない
+/// - 旧 logic は parent 不在なら watched_dir を「 safe 」 とみなして path を
+///   返していたが、 caller (= receive::handle_upsert) が `create_dir_all` を
+///   呼ぶと OS は symlink を辿って outside にdir 作成 → 外部書込が成立
+///
+/// 修正後の logic (= Phase 2 review High 1):
+///
+/// 1. `validate_relative_path` で構文 check (`..` / absolute / backslash 拒否)
+/// 2. watched_dir 自体を `symlink_metadata` で見て、 dir である事を確認 (= caller
+///    側で canonicalize 済前提でも、 念のため defense-in-depth)
+/// 3. rel_path の component を 1 つずつ accumulate しながら symlink_metadata
+///    で見る。 中間 component が **存在しかつ symlink** なら即 reject。
+///    不在は OK (= 末端 file はまだ無くてもよい)
+/// 4. file 名 (= 末端 component) 自体は symlink でも OK にしない (= file が
+///    別所を指す状況も拒否)
 ///
 /// 呼ぶ側は `watched_dir` を **既に canonicalize 済の path** で渡す前提
 /// (= daemon 起動時に 1 度だけ canonicalize、 以降使い回す)。
 pub fn resolve_safe_path(watched_dir_canonical: &Path, rel_path: &str) -> Result<PathBuf> {
     validate_relative_path(rel_path)?;
-    let joined = watched_dir_canonical.join(rel_path);
-    let parent = joined
-        .parent()
-        .ok_or_else(|| anyhow!("rel_path has no parent: {rel_path}"))?;
 
-    // parent が既に存在する場合は canonicalize して watched_dir 配下か検証。
-    // 不在 (= 新規 dir に書く) なら、 watched_dir まで遡って canonicalize し、
-    // 残り component に `..` / symlink がない構文 check (= validate_relative_path
-    // で `..` は既に拒否済なので、 ここでは canonicalize できる範囲を使う)。
-    let canonical_parent = if parent.exists() {
-        parent
-            .canonicalize()
-            .with_context(|| format!("canonicalize {}", parent.display()))?
-    } else {
-        watched_dir_canonical.to_path_buf()
-    };
-
-    if !canonical_parent.starts_with(watched_dir_canonical) {
+    // watched_dir 自体の sanity check (= 不在 / symlink/file への置き換えを検知)
+    let root_meta = std::fs::symlink_metadata(watched_dir_canonical)
+        .with_context(|| format!("symlink_metadata {}", watched_dir_canonical.display()))?;
+    if !root_meta.file_type().is_dir() {
         return Err(anyhow!(
-            "path escapes watched_dir: {} not under {}",
-            canonical_parent.display(),
+            "watched_dir is not a directory: {}",
             watched_dir_canonical.display()
         ));
     }
-    Ok(joined)
+
+    // rel_path の component を 1 つずつ確認しながら walk。 中間 symlink を拒否。
+    let mut current = watched_dir_canonical.to_path_buf();
+    let components: Vec<&str> = rel_path.split('/').collect();
+    let last_index = components.len() - 1;
+    for (i, comp) in components.iter().enumerate() {
+        current.push(comp);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                if ft.is_symlink() {
+                    return Err(anyhow!(
+                        "path escapes watched_dir via symlink at {}",
+                        current.display()
+                    ));
+                }
+                // 中間 component が file になっていた = 衝突状況。 末端 file ならOK
+                if i < last_index && !ft.is_dir() {
+                    return Err(anyhow!(
+                        "intermediate component is not a directory: {}",
+                        current.display()
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 不在 = OK。 ただし以降の component を見る意味はない (= path 末端まで
+                // 不在 prefix 内、 caller の create_dir_all が新規作成する)
+                break;
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "symlink_metadata {}: {e}",
+                    current.display()
+                ));
+            }
+        }
+    }
+
+    Ok(watched_dir_canonical.join(rel_path))
 }
 
 /// local file を blob 化して gossip mesh に Upsert broadcast する。
@@ -241,6 +278,48 @@ mod tests {
         std::os::unix::fs::symlink(&outside_canonical, root.join("escape_dir")).unwrap();
         let e = resolve_safe_path(&root, "escape_dir/foo.md").unwrap_err();
         assert!(format!("{e:#}").contains("escapes watched_dir"));
+    }
+
+    /// High 1 review fix の regression test: `watched/link → /tmp/outside` が
+    /// 既存で、 受信 path が `link/new/file.md` のように **link 配下の不在
+    /// subdir** を指すケース。 旧 logic では parent 不在 → watched_dir を safe
+    /// 扱い → caller の create_dir_all が symlink を辿って outside に作成、 と
+    /// なる脱出経路が成立していた。 修正後は最初の component で symlink を
+    /// 検出して reject する。
+    #[cfg(unix)]
+    #[test]
+    fn resolve_safe_path_rejects_nested_path_through_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_canonical = outside.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(&outside_canonical, root.join("link")).unwrap();
+
+        let e = resolve_safe_path(&root, "link/new_subdir/file.md").unwrap_err();
+        assert!(
+            format!("{e:#}").contains("symlink"),
+            "expected symlink reject, got: {e:#}"
+        );
+        // 「 outside dir に new_subdir が誤って作られていない」 ことも assert
+        assert!(
+            !outside_canonical.join("new_subdir").exists(),
+            "must not have leaked into outside dir"
+        );
+    }
+
+    /// 末端 component が symlink でも reject (= file が別所を指す状況拒否)。
+    #[cfg(unix)]
+    #[test]
+    fn resolve_safe_path_rejects_terminal_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_file = outside.path().join("target.md");
+        std::fs::write(&outside_file, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside_file, root.join("link.md")).unwrap();
+
+        let e = resolve_safe_path(&root, "link.md").unwrap_err();
+        assert!(format!("{e:#}").contains("symlink"));
     }
 
     #[test]
