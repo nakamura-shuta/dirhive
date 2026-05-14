@@ -17,7 +17,7 @@ use iroh_blobs::Hash;
 pub type WriteRegistry = Arc<Mutex<HashMap<PathBuf, Hash>>>;
 
 /// 双方向同期で必要な共有 state。
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SyncState {
     /// 受信 → write 中 の rel_path → expected hash。
     /// `receive_loop` が download 開始前に insert、成功時に `last_written` へ
