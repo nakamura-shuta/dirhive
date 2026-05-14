@@ -65,6 +65,12 @@ pub fn default_allowlist_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("allowlist.json"))
 }
 
+/// gossip bootstrap peer addresses (= 起動時に subscribe へ渡す JSON。
+/// `accept-invite` で inviter の EndpointAddr を 1 件 append する)。
+pub fn default_bootstrap_peers_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("bootstrap-peers.json"))
+}
+
 pub fn default_key_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("endpoint.key"))
 }

@@ -26,8 +26,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use iroh::Endpoint;
+use iroh::address_lookup::MemoryLookup;
 use iroh::protocol::Router;
+use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::fs::FsStore;
 use iroh_gossip::api::GossipTopic;
@@ -35,7 +36,7 @@ use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
 
 use crate::allowlist::AllowList;
-use crate::allowlist_blobs::AllowlistBlobs;
+use crate::allowlist_blobs::{AllowlistBlobs, BlobServeCallback};
 
 /// `derive_topic_id` で使う固定 prefix (= protocol versioning + domain separation)。
 /// `\0` までを 1 つの byte string 扱いするので `b"p2p-dir-sync/v1/topic\0"` を
@@ -91,29 +92,75 @@ impl SyncRuntime {
     /// 成功し、 Router は両 ALPN を accept する。 gossip topic だけ subscribe
     /// 未済になる (= mesh に居ない)。 invite / accept で folder_secret 確定
     /// 後の `daemon` 再起動で改めて build し直す想定 (= design §3.4)。
+    ///
+    /// `bootstrap_peers` (= Phase 3 review H1): gossip.subscribe に渡す既知
+    /// peer 一覧。 invite/accept-invite 経由で得た inviter の EndpointAddr を
+    /// 永続化したものを load して渡す。 空でも build は通るが、 そのとき他
+    /// peer と接続が成立せず file sync が動かない。
     pub async fn build(
         endpoint: Endpoint,
         blobs_dir: &Path,
         allowlist: Arc<AllowList>,
         folder_secret: Option<&[u8; 16]>,
+        bootstrap_peers: Vec<EndpointAddr>,
+    ) -> Result<Self> {
+        Self::build_with_serve_callback(
+            endpoint,
+            blobs_dir,
+            allowlist,
+            folder_secret,
+            bootstrap_peers,
+            None,
+        )
+        .await
+    }
+
+    /// `on_blob_serve_success` callback 付きの builder (= daemon main 用、
+    /// blob serve 成功時に DaemonState::mark_peer_seen を呼ぶ hook を渡す)。
+    pub async fn build_with_serve_callback(
+        endpoint: Endpoint,
+        blobs_dir: &Path,
+        allowlist: Arc<AllowList>,
+        folder_secret: Option<&[u8; 16]>,
+        bootstrap_peers: Vec<EndpointAddr>,
+        on_blob_serve_success: Option<BlobServeCallback>,
     ) -> Result<Self> {
         let store = FsStore::load(blobs_dir)
             .await
             .with_context(|| format!("FsStore::load {}", blobs_dir.display()))?;
         let blobs = BlobsProtocol::new(&store, None);
-        let allow_wrapped = AllowlistBlobs::new(blobs.clone(), allowlist);
+        let allow_wrapped = match on_blob_serve_success {
+            Some(cb) => AllowlistBlobs::with_serve_callback(blobs.clone(), allowlist, cb),
+            None => AllowlistBlobs::new(blobs.clone(), allowlist),
+        };
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
-        let router = Router::builder(endpoint)
+        let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, allow_wrapped)
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
 
         let (topic, topic_id) = if let Some(secret) = folder_secret {
             let id = derive_topic_id(secret);
+            // bootstrap peers の EndpointAddr を endpoint の address_lookup に
+            // 教え込む (= relay URL / direct addrs を MemoryLookup で登録)。
+            // これがないと gossip dialer は EndpointId だけでは peer を reach
+            // できず、 subscribe(topic, ids) を渡しても mesh が成立しない。
+            if !bootstrap_peers.is_empty() {
+                let memory = MemoryLookup::from_endpoint_info(bootstrap_peers.clone());
+                match endpoint.address_lookup() {
+                    Ok(lookups) => lookups.add(memory),
+                    Err(e) => {
+                        tracing::warn!(
+                            "endpoint.address_lookup() unavailable, bootstrap MemoryLookup not registered: {e}"
+                        );
+                    }
+                }
+            }
+            let bootstrap_ids: Vec<_> = bootstrap_peers.iter().map(|a| a.id).collect();
             let t = gossip
-                .subscribe(id, Vec::new())
+                .subscribe(id, bootstrap_ids)
                 .await
                 .map_err(|e| anyhow::anyhow!("gossip subscribe: {e}"))?;
             (Some(t), Some(id))
@@ -235,7 +282,7 @@ mod tests {
             .expect("endpoint bind");
 
         let allowlist = Arc::new(AllowList::empty_strict());
-        let rt = SyncRuntime::build(endpoint, tmp.path(), allowlist, None)
+        let rt = SyncRuntime::build(endpoint, tmp.path(), allowlist, None, Vec::new())
             .await
             .expect("runtime build");
 
@@ -257,7 +304,7 @@ mod tests {
 
         let allowlist = Arc::new(AllowList::empty_strict());
         let folder_secret = [0x42u8; 16];
-        let rt = SyncRuntime::build(endpoint, tmp.path(), allowlist, Some(&folder_secret))
+        let rt = SyncRuntime::build(endpoint, tmp.path(), allowlist, Some(&folder_secret), Vec::new())
             .await
             .expect("runtime build");
 
@@ -278,7 +325,7 @@ mod tests {
             .expect("endpoint bind");
 
         let allowlist = Arc::new(AllowList::empty_strict());
-        let mut rt = SyncRuntime::build(endpoint, tmp.path(), allowlist, Some(&[0u8; 16]))
+        let mut rt = SyncRuntime::build(endpoint, tmp.path(), allowlist, Some(&[0u8; 16]), Vec::new())
             .await
             .expect("runtime build");
 

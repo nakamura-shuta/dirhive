@@ -47,6 +47,8 @@ pub struct DaemonPaths {
     pub key_path: PathBuf,
     pub blobs_dir: PathBuf,
     pub log_path: PathBuf,
+    /// gossip bootstrap peer addresses (= Phase 3 review H1)。
+    pub bootstrap_peers_path: PathBuf,
 }
 
 /// 「 folder_secret は持っているか 」 「 gossip topic は subscribe しているか 」 を
@@ -256,6 +258,7 @@ mod tests {
             key_path: tmp.join("endpoint.key"),
             blobs_dir: tmp.join("blobs"),
             log_path: tmp.join("p2p-dir-sync.log"),
+            bootstrap_peers_path: tmp.join("bootstrap-peers.json"),
         }
     }
 
@@ -303,6 +306,7 @@ mod tests {
             &paths.blobs_dir,
             allowlist.clone(),
             Some(&[0u8; 16]),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -362,6 +366,7 @@ mod tests {
             &paths.blobs_dir,
             allowlist.clone(),
             None,
+            Vec::new(),
         )
         .await
         .unwrap();

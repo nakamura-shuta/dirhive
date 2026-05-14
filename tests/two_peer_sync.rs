@@ -41,6 +41,7 @@ impl Daemon {
             .env("P2P_SYNC_CONFIG_DIR", state_dir.path().join("config"))
             .env("P2P_SYNC_LOG_DIR", state_dir.path().join("logs"))
             .env("P2P_SYNC_LOG", "warn")
+            .env("P2P_SYNC_LOG", "info,p2p_dir_sync=debug")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -100,6 +101,7 @@ impl Daemon {
             .env("P2P_SYNC_CONFIG_DIR", state_dir.path().join("config"))
             .env("P2P_SYNC_LOG_DIR", state_dir.path().join("logs"))
             .env("P2P_SYNC_LOG", "warn")
+            .env("P2P_SYNC_LOG", "info,p2p_dir_sync=debug")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -193,22 +195,53 @@ async fn two_peer_invite_accept_file_sync() {
     .expect("alice allow-peer");
     assert_eq!(ap["added"], true);
 
+    // mesh connection が安定するまで待つ。 gossip plumtree は opportunistic
+    // forward なので、 broadcast 時点で neighbor 未接続だと message が drop され、
+    // file は永遠に伝搬しない。 N0 relay + holepunching で接続 settle まで
+    // 数秒かかるので、 余裕を持って 8s 待つ。
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
     // (8) Alice 側 watched_dir に file を作る
     let alice_watch = alice.watch_dir.path().to_path_buf();
     let bob_watch = bob.watch_dir.path().to_path_buf();
     std::fs::write(alice_watch.join("hello.md"), b"hello from alice").unwrap();
 
-    // Bob 側に伝搬まで待つ
+    // Bob 側に伝搬まで待つ。 N0 relay + pkarr 経由なので保守的に 90s 待つ。
     let propagated = wait_for_file(
         &bob_watch,
         "hello.md",
         b"hello from alice",
-        Duration::from_secs(45),
+        Duration::from_secs(90),
     )
     .await;
-    assert!(propagated, "alice's edit did not reach bob within 45s");
+    if !propagated {
+        // 失敗時は alice / bob の log file を read して diagnostics を出す
+        let alice_log = alice
+            .state_dir
+            .path()
+            .join("logs/p2p-dir-sync.log");
+        let bob_log = bob
+            .state_dir
+            .path()
+            .join("logs/p2p-dir-sync.log");
+        let alice_tail = std::fs::read_to_string(&alice_log).unwrap_or_default();
+        let bob_tail = std::fs::read_to_string(&bob_log).unwrap_or_default();
+        let _ = alice.stop().await;
+        let _ = bob.stop().await;
+        panic!(
+            "alice's edit did not reach bob within 90s\n--- alice log tail ---\n{}\n--- bob log tail ---\n{}",
+            tail_n(&alice_tail, 60),
+            tail_n(&bob_tail, 60)
+        );
+    }
 
     // cleanup
     let _ = alice.stop().await;
     let _ = bob.stop().await;
+}
+
+fn tail_n(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }

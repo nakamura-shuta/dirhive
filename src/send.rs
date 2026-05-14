@@ -348,6 +348,7 @@ mod tests {
             tmp.path(),
             Arc::new(AllowList::empty_strict()),
             Some(&folder_secret),
+            Vec::new(),
         )
         .await
         .unwrap();

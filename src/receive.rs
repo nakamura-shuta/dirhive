@@ -531,6 +531,7 @@ mod tests {
             tmp.path(),
             Arc::new(AllowList::empty_strict()),
             Some(&[0u8; 16]),
+            Vec::new(),
         )
         .await
         .unwrap();

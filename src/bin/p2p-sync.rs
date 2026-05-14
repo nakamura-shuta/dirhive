@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use p2p_dir_sync::allowlist::AllowList;
+use p2p_dir_sync::bootstrap_peers;
 use p2p_dir_sync::daemon::dispatch::Dispatcher;
 use p2p_dir_sync::daemon::listener::{
     DynDispatcher, acquire_daemon_lock, bind_listener_with_lock, probe_existing_socket,
@@ -131,11 +132,33 @@ async fn main() -> Result<()> {
     };
 
     // (11) SyncRuntime::build
-    let mut sync_runtime = SyncRuntime::build(
+    // bootstrap_peers (= H1 review fix): accept-invite で永続化された inviter の
+    // EndpointAddr を load し、 起動時 gossip.subscribe + address_lookup 登録に渡す。
+    let bootstrap = bootstrap_peers::load_bootstrap_peers(&daemon_paths.bootstrap_peers_path)
+        .context("load bootstrap-peers.json")?;
+    if !bootstrap.is_empty() {
+        tracing::info!(count = bootstrap.len(), "loaded bootstrap peers");
+    }
+    // blob serve callback (= Phase 3 review M3): DaemonState を取得した後に
+    // 改めて register したいが、 AllowlistBlobs は Router 構築時に確定する必要が
+    // あるので「 Arc<OnceLock<...>> 経由 」 にして後から実体を差し込む形にする。
+    let mark_peer_seen_slot: Arc<std::sync::OnceLock<Arc<DaemonState>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let slot_for_cb = mark_peer_seen_slot.clone();
+    let serve_cb: p2p_dir_sync::allowlist_blobs::BlobServeCallback =
+        Arc::new(move |peer, t| {
+            if let Some(state) = slot_for_cb.get() {
+                state.mark_peer_seen(peer, t);
+            }
+        });
+
+    let mut sync_runtime = SyncRuntime::build_with_serve_callback(
         endpoint.clone(),
         &daemon_paths.blobs_dir,
         allowlist.clone(),
         folder_secret.as_ref(),
+        bootstrap,
+        Some(serve_cb),
     )
     .await
     .context("SyncRuntime::build")?;
@@ -167,6 +190,11 @@ async fn main() -> Result<()> {
         gossip_sender_opt,
         runtime_status,
     ));
+    // blob serve callback の slot に DaemonState を差し込む (= 起動後の serve
+    // 成功で mark_peer_seen が呼ばれる)。
+    mark_peer_seen_slot
+        .set(state.clone())
+        .map_err(|_| anyhow!("mark_peer_seen_slot already set"))?;
 
     // (13) listener spawn (early lock を pass-through)
     let dispatcher: Arc<dyn DynDispatcher> = Arc::new(Dispatcher::new(state.clone()));
@@ -263,18 +291,43 @@ async fn main() -> Result<()> {
                             tracing::warn!(path = %rel_str, "broadcast_tombstone failed: {e:#}");
                         }
                     } else {
-                        // last_written に同 hash がある = receive で書いた直後 → skip
-                        let suppress_hash = {
+                        // self-loop 防止 (= Phase 3 review H2):
+                        // 1. abs_target を read して BLAKE3 hash を計算
+                        // 2. last_written[rel] == hash なら receive 経路が書いた直後の
+                        //    file が watcher で再 broadcast されようとしている →
+                        //    consume + skip。 異なる hash なら user の編集 → broadcast。
+                        // last_written は受信 / 送信 自身どちらでも記録される (=
+                        // self-broadcast の 2 重防止)。
+                        let expected = {
                             let last = state.sync_state.last_written.lock().expect("lock");
                             last.get(&rel).copied()
                         };
-                        if let Some(_h) = suppress_hash {
-                            // hash 比較は send_file 側でも行うが、 watcher 段で
-                            // shortcut できる (= 連続 event の skip)
-                            tracing::trace!(
-                                path = %rel_str,
-                                "watcher Modify shortcut (last_written hit)"
-                            );
+                        if let Some(expected_hash) = expected {
+                            match std::fs::read(&abs_target) {
+                                Ok(bytes) => {
+                                    let current = iroh_blobs::Hash::new(&bytes);
+                                    if current == expected_hash {
+                                        // consume + skip
+                                        let mut last = state
+                                            .sync_state
+                                            .last_written
+                                            .lock()
+                                            .expect("lock");
+                                        last.remove(&rel);
+                                        tracing::debug!(
+                                            path = %rel_str,
+                                            "watcher Modify suppressed (= self-loop, hash match)"
+                                        );
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        path = %rel_str,
+                                        "could not read file for self-loop check: {e}"
+                                    );
+                                }
+                            }
                         }
                         if let Err(e) = send_file(
                             &rel_str,
@@ -328,6 +381,7 @@ fn build_daemon_paths(watched_dir: &Path) -> Result<DaemonPaths> {
         key_path: paths::default_key_path()?,
         blobs_dir: paths::default_blobs_dir()?,
         log_path: paths::default_log_path()?,
+        bootstrap_peers_path: paths::default_bootstrap_peers_path()?,
     })
 }
 

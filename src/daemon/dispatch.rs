@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::allowlist::PeerInfo;
+use crate::bootstrap_peers;
 use crate::keystore;
 use crate::message::InviteTicket;
 use crate::pending_log;
@@ -145,7 +146,8 @@ impl Dispatcher {
         let p: P = serde_json::from_value(params).context("parse accept-invite params")?;
 
         let invite = InviteTicket::decode(&p.ticket)?;
-        let inviter_id = invite.endpoint.endpoint_addr().id;
+        let inviter_addr = invite.endpoint.endpoint_addr().clone();
+        let inviter_id = inviter_addr.id;
 
         // folder_secret 整合 check + adopt:
         // - 不在 → adopt + persist + enter_initialized_but_not_subscribed
@@ -173,6 +175,17 @@ impl Dispatcher {
         self.state
             .allowlist
             .add_and_save(inviter_id, info, &paths.allowlist_path)?;
+
+        // inviter の EndpointAddr を bootstrap_peers に永続化 (= H1 review fix)。
+        // 次回起動時 SyncRuntime::build がこの addr を gossip.subscribe + endpoint
+        // address_lookup に渡して、 mesh discovery を成立させる。
+        bootstrap_peers::add_or_replace(&paths.bootstrap_peers_path, inviter_addr)
+            .with_context(|| {
+                format!(
+                    "persist inviter addr to {}",
+                    paths.bootstrap_peers_path.display()
+                )
+            })?;
 
         // restart_required は真の runtime_status から (= H1 review fix)。
         let restart_required = self.state.current_runtime_status().restart_required();
@@ -398,6 +411,7 @@ mod tests {
             key_path: state_tmp.path().join("endpoint.key"),
             blobs_dir: state_tmp.path().join("blobs"),
             log_path: state_tmp.path().join("p2p-dir-sync.log"),
+            bootstrap_peers_path: state_tmp.path().join("bootstrap-peers.json"),
         };
 
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
@@ -425,6 +439,7 @@ mod tests {
             &paths.blobs_dir,
             allowlist.clone(),
             folder_secret.as_ref(),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -556,6 +571,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("invalid peer_id"));
+    }
+
+    /// H1 review fix: accept-invite で inviter の EndpointAddr が
+    /// bootstrap_peers に永続化される (= 次回起動時に gossip.subscribe に渡される)。
+    #[tokio::test]
+    async fn accept_invite_persists_inviter_addr_for_bootstrap() {
+        let (inviter, _s1, _w1) = build_dispatcher(0x31, false).await;
+        let inv = inviter.invite().await.unwrap();
+        let ticket = inv["ticket"].as_str().unwrap().to_string();
+
+        let (acceptor, _s2, _w2) = build_dispatcher(0x32, false).await;
+        acceptor
+            .accept_invite(serde_json::json!({"ticket": ticket}))
+            .await
+            .unwrap();
+
+        let saved = crate::bootstrap_peers::load_bootstrap_peers(
+            &acceptor.state.paths.bootstrap_peers_path,
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1, "inviter addr must be persisted");
+        assert_eq!(saved[0].id, inviter.state.self_endpoint_id);
     }
 
     #[tokio::test]

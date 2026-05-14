@@ -17,6 +17,7 @@
 //! 相手側で同じ wrapper が動いていて reject するため両方向止まる。
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -25,21 +26,56 @@ use iroh_blobs::BlobsProtocol;
 
 use crate::allowlist::AllowList;
 
+/// blob serve 成功時に呼ぶ callback (= Phase 3 review M3 / L4 と整合)。
+///
+/// `AllowlistBlobs::accept` が `inner.accept(conn).await` 完了で `Ok(())` を
+/// 返した直後に呼ぶ。 引数は (`remote_id`, epoch 秒)。 daemon main から
+/// `DaemonState::mark_peer_seen` に繋いで `sync.list-peers.last_seen_at` を
+/// 更新する。
+pub type BlobServeCallback = Arc<dyn Fn(EndpointId, i64) + Send + Sync>;
+
 /// reject 時に peer に送る application error code (= HTTP 401 を borrow した値)。
 /// peer 側で `ConnectionError::ApplicationClosed { error_code: 401, .. }` として
 /// 観測できる。peer 側 log で「許可されていない」 と区別しやすくする目的。
 pub const REJECT_CODE_UNAUTHORIZED: u32 = 401;
 
 /// `BlobsProtocol` を allowlist 認可 layer で wrap する。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AllowlistBlobs {
     inner: BlobsProtocol,
     allowlist: Arc<AllowList>,
+    /// blob serve 成功時に呼ぶ callback (= mark_peer_seen 連携)。
+    on_serve_success: Option<BlobServeCallback>,
+}
+
+impl std::fmt::Debug for AllowlistBlobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AllowlistBlobs")
+            .field("has_on_serve_success", &self.on_serve_success.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AllowlistBlobs {
     pub fn new(inner: BlobsProtocol, allowlist: Arc<AllowList>) -> Self {
-        Self { inner, allowlist }
+        Self {
+            inner,
+            allowlist,
+            on_serve_success: None,
+        }
+    }
+
+    /// callback 付きで構築 (= daemon main 用)。
+    pub fn with_serve_callback(
+        inner: BlobsProtocol,
+        allowlist: Arc<AllowList>,
+        on_serve_success: BlobServeCallback,
+    ) -> Self {
+        Self {
+            inner,
+            allowlist,
+            on_serve_success: Some(on_serve_success),
+        }
     }
 
     /// peer が許可されているか (= `open_all` or 明示登録)。
@@ -72,7 +108,18 @@ impl ProtocolHandler for AllowlistBlobs {
             peer = %remote_id.fmt_short(),
             "blob ALPN connection accepted"
         );
-        self.inner.accept(conn).await
+        let result = self.inner.accept(conn).await;
+        // serve 完了 (= provider session 終了) → mark_peer_seen hook
+        if result.is_ok()
+            && let Some(cb) = &self.on_serve_success
+        {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            cb(remote_id, now);
+        }
+        result
     }
 
     async fn shutdown(&self) {
@@ -154,5 +201,27 @@ mod tests {
         let wrap = AllowlistBlobs::new(blobs, al);
         assert!(wrap.is_authorized(&id1));
         assert!(!wrap.is_authorized(&id2));
+    }
+
+    /// M3 review fix: with_serve_callback で構築すると on_serve_success が
+    /// 保持される (= 構築 path の smoke、 実 dispatch は 2-peer e2e で確認)。
+    #[tokio::test]
+    async fn with_serve_callback_holds_callback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("blobs"))
+            .await
+            .unwrap();
+        let blobs = BlobsProtocol::new(&store, None);
+        let al = Arc::new(AllowList::empty_strict());
+        let counter = Arc::new(std::sync::Mutex::new(0u32));
+        let counter2 = counter.clone();
+        let cb: BlobServeCallback = Arc::new(move |_id, _t| {
+            *counter2.lock().unwrap() += 1;
+        });
+        let wrap = AllowlistBlobs::with_serve_callback(blobs, al, cb);
+        // Debug にも反映されている
+        let dbg = format!("{wrap:?}");
+        assert!(dbg.contains("has_on_serve_success: true"));
+        assert_eq!(*counter.lock().unwrap(), 0);
     }
 }

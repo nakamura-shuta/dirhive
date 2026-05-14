@@ -28,6 +28,7 @@
 // Phase 1 では空 module 宣言のみ。Phase 2 以降で実装する。
 pub mod allowlist;
 pub mod allowlist_blobs;
+pub mod bootstrap_peers;
 pub mod conflict;
 pub mod daemon;
 pub mod keystore;
