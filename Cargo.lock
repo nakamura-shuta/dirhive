@@ -2866,6 +2866,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
