@@ -20,7 +20,10 @@ set -euo pipefail
 
 # --- cleanup --------------------------------------------------------------
 cleanup() {
-  for pid in "${ALICE_PID:-}" "${BOB_PID:-}"; do
+  # `SPAWN_PID` も対象に含める (= spawn_daemon が socket polling 中に fail_msg
+  # した場合、 SPAWN_PID は set されているが呼出側 ALICE_PID / BOB_PID への代入
+  # 前 → ALICE_PID 経由だけでは半起動 daemon が orphan に。 重複 kill は noop。
+  for pid in "${ALICE_PID:-}" "${BOB_PID:-}" "${SPAWN_PID:-}"; do
     [[ -n "${pid}" ]] || continue
     kill "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
