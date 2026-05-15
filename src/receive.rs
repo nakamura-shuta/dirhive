@@ -70,6 +70,13 @@ use crate::state::{PendingTracker, SyncState};
 /// で繋ぐ想定 (= Phase 3 後半で AllowlistBlobs に追加予定)。
 pub type PeerSeenCallback = Arc<dyn Fn(EndpointId, i64) + Send + Sync>;
 
+/// gossip `Event::NeighborUp` 観測 callback (= Phase 3 review H1)。
+///
+/// receive_loop が `Event::NeighborUp(id)` を観測するたびに呼ばれる。 caller
+/// (= daemon main) は CAS で「 初回 join 」 を判定し、 初回なら
+/// pending_initial_broadcasts を drain して send_file を発火する。
+pub type OnNeighborUpCallback = Arc<dyn Fn(EndpointId) + Send + Sync>;
+
 /// receive 経路の動作結果 (= test で観測しやすくするため enum 化)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiveOutcome {
@@ -80,8 +87,9 @@ pub enum ReceiveOutcome {
 /// receive_loop の per-event ハンドラ。 本体 loop は GossipReceiver から
 /// `Event::Received` を取り出して `dispatch_update` に渡し、 他 event は log。
 ///
-/// `on_peer_seen` は Applied 時の data-plane 成功通知 callback (= L4)。 None なら
-/// 何もしない (= 単独 use case では callback 不要)。
+/// `on_peer_seen` は Applied 時の data-plane 成功通知 callback (= L4)。
+/// `on_neighbor_up` は gossip 上で peer と接続成立した時の callback (= H1)。
+/// どちらも None なら何もしない。
 #[allow(clippy::too_many_arguments)]
 pub async fn receive_loop(
     mut receiver: GossipReceiver,
@@ -92,6 +100,7 @@ pub async fn receive_loop(
     watched_dir_canonical: PathBuf,
     pending: Arc<PendingTracker>,
     on_peer_seen: Option<PeerSeenCallback>,
+    on_neighbor_up: Option<OnNeighborUpCallback>,
 ) -> Result<()> {
     while let Some(event) = receiver.next().await {
         let event = match event {
@@ -123,7 +132,10 @@ pub async fn receive_loop(
                 }
             }
             Event::NeighborUp(id) => {
-                tracing::debug!(peer = %id.fmt_short(), "neighbor up")
+                tracing::debug!(peer = %id.fmt_short(), "neighbor up");
+                if let Some(cb) = &on_neighbor_up {
+                    cb(id);
+                }
             }
             Event::NeighborDown(id) => {
                 tracing::debug!(peer = %id.fmt_short(), "neighbor down")

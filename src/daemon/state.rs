@@ -13,7 +13,9 @@
 //! 「 dispatch handler が必要とする最小集合 」 で持つ。 send / receive loop は
 //! 別に loop handle を持つ (= daemon main で spawn 後 hold)。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -134,6 +136,18 @@ pub struct DaemonState {
     pub start_instant: Instant,
     /// peer → 直近 data-plane 成立 epoch 秒。
     pub last_seen_at: LastSeenMap,
+
+    /// 初回 gossip neighbor up を観測したか (= Phase 3 review H1)。
+    ///
+    /// `false` のあいだは watcher event を直接 broadcast せず、
+    /// `pending_initial_broadcasts` に貯める (= gossip plumtree は neighbor 未接続
+    /// 時に broadcast を drop するので、 初回接続前の編集が永遠に届かない race を
+    /// 防ぐ)。 初回 NeighborUp 観測時に `true` に CAS して queue を drain する。
+    pub gossip_joined: Arc<AtomicBool>,
+
+    /// 初回 join 待ちの間に watcher が観測した「 broadcast 対象 path 」 set。
+    /// CAS で初回 join を観測した task が drain して send_file を一括 invoke する。
+    pub pending_initial_broadcasts: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl DaemonState {
@@ -179,7 +193,71 @@ impl DaemonState {
             gossip_runtime: Arc::new(Mutex::new(inner)),
             start_instant: Instant::now(),
             last_seen_at: Arc::new(Mutex::new(Default::default())),
+            gossip_joined: Arc::new(AtomicBool::new(false)),
+            pending_initial_broadcasts: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// 初回 NeighborUp 観測時に呼ぶ。 CAS で **本当に初回** なら true を返す。
+    /// caller (= receive_loop 側 callback) は true が返ったときだけ
+    /// pending_initial_broadcasts を drain して送信を起こす。
+    pub fn mark_first_join(&self) -> bool {
+        // false → true への CAS 成功 = 初回 join
+        self.gossip_joined
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// 現在 gossip 上で 1 つ以上の neighbor と接続済か。
+    pub fn is_gossip_joined(&self) -> bool {
+        self.gossip_joined.load(Ordering::Acquire)
+    }
+
+    /// watcher 側で初回 join 待ちの change を queue に積む (= H1 review fix)。
+    /// 戻り値: 「 join 未完了で queue に積まれた 」 ら true。
+    /// 既に join 済なら queue を経由せず caller がそのまま broadcast する想定で
+    /// false を返す。
+    ///
+    /// **TOCTOU race fix (= H1 followup)**: `is_gossip_joined()` の check と
+    /// `insert` を mutex で囲み、 **mutex 取得後に再度 atomic flag を読む**。
+    /// drain 側 (`drain_pending_initial`) は同じ mutex を取得するので、
+    /// 以下の悪い順序を排除する:
+    ///
+    /// ```text
+    ///   thread W (watcher):                thread N (NeighborUp callback):
+    ///   --- 旧 buggy logic ---
+    ///   1. is_gossip_joined() == false
+    ///                                      2. mark_first_join() → true
+    ///                                      3. drain → 空 Vec
+    ///   4. lock().insert(rel)              (rel が queue に取り残される)
+    ///   --- 修正後 ---
+    ///   1. let g = lock()
+    ///   2. is_gossip_joined() を g 下で再読
+    ///      → ここで N がもし drain 済なら見える (g は N が drain 完了で解放)
+    ///   3. true なら insert せず false を返す → caller が直接 broadcast
+    /// ```
+    pub fn enqueue_initial_broadcast(&self, rel: PathBuf) -> bool {
+        let mut g = self
+            .pending_initial_broadcasts
+            .lock()
+            .expect("pending lock");
+        if self.is_gossip_joined() {
+            // mutex 取得を待っていた間に NeighborUp 側が join + drain 完了。
+            // ここで insert しても drain されないので caller に false を返し、
+            // caller (= watcher closure) は直接 send_file を呼ぶ。
+            return false;
+        }
+        g.insert(rel);
+        true
+    }
+
+    /// queue を drain して Vec<PathBuf> を返す。 初回 join 完了 callback で呼ぶ。
+    pub fn drain_pending_initial(&self) -> Vec<PathBuf> {
+        let mut g = self
+            .pending_initial_broadcasts
+            .lock()
+            .expect("pending lock");
+        g.drain().collect()
     }
 
     /// uptime 秒 (= sync.status / health-check 用)。
@@ -338,7 +416,131 @@ mod tests {
         assert!(st.current_runtime_status().restart_required());
         assert!(st.gossip_sender_cloned().is_none(), "Initialized は sender None");
 
+        // H1 review fix: 初回 join gate + pending queue
+        assert!(!st.is_gossip_joined(), "starts not joined");
+        // 未 join なので watcher event は queue に積む
+        let r1 = PathBuf::from("a.md");
+        let r2 = PathBuf::from("b.md");
+        assert!(st.enqueue_initial_broadcast(r1.clone()));
+        assert!(st.enqueue_initial_broadcast(r2.clone()));
+        // 同 path の再 enqueue は HashSet なので dedup
+        assert!(st.enqueue_initial_broadcast(r1.clone()));
+        // mark_first_join: 初回 true、 2 回目 false
+        assert!(st.mark_first_join());
+        assert!(!st.mark_first_join());
+        assert!(st.is_gossip_joined());
+        // drain で 2 path 取得 (dedup 済)
+        let drained = st.drain_pending_initial();
+        let drained_set: std::collections::HashSet<_> = drained.into_iter().collect();
+        let mut expected = std::collections::HashSet::new();
+        expected.insert(r1);
+        expected.insert(r2);
+        assert_eq!(drained_set, expected);
+        // join 済以降は enqueue が false を返す (= 直接 broadcast すべき)
+        assert!(!st.enqueue_initial_broadcast(PathBuf::from("c.md")));
+
         rt.shutdown().await.unwrap();
+    }
+
+    /// H1 followup review fix: enqueue + mark_first_join + drain の TOCTOU
+    /// race regression test。 並行に N 個の enqueue を実行しつつ別 thread で
+    /// mark_first_join → drain を行い、 **どの path も「 enqueue=true なのに
+    /// drained に居ない 」 状態にならない** ことを assert する (= caller が
+    /// false を観測した path は直接 broadcast する責務)。
+    ///
+    /// 旧 logic では:
+    ///   W: is_gossip_joined()=false
+    ///   N: CAS true; drain → 空
+    ///   W: insert → 取り残し
+    /// で path が永遠に届かなくなる race があった。 修正後は enqueue が mutex
+    /// 取得後に再 check するので、 drain 後の insert は false を返す経路に乗る。
+    #[tokio::test]
+    async fn enqueue_and_mark_first_join_do_not_lose_paths_under_concurrency() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let watch_tmp = tempfile::TempDir::new().unwrap();
+        let watched = watch_tmp.path().canonicalize().unwrap();
+        let paths = fixture_paths(tmp.path(), &watched);
+        let allowlist = Arc::new(AllowList::empty_strict());
+        let pending = Arc::new(PendingTracker {
+            pending_root: tmp.path().join("pending"),
+            repo_hash: compute_repo_hash(&watched),
+        });
+        std::fs::create_dir_all(&pending.pending_root).unwrap();
+
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&[0x44; 32]))
+            .bind()
+            .await
+            .unwrap();
+        let mut rt = SyncRuntime::build(
+            endpoint.clone(),
+            &paths.blobs_dir,
+            allowlist.clone(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let _ = rt.take_topic(); // None
+        let st = Arc::new(DaemonState::new(
+            paths,
+            allowlist,
+            pending,
+            SyncState::new(),
+            rt.endpoint().clone(),
+            rt.blobs().clone(),
+            None,
+            RuntimeStatus::Uninitialized,
+        ));
+
+        // N 個の enqueue を並行で実行 + 1 つの mark_first_join + drain を同時走らせる
+        let n = 100;
+        let mut enq_handles = Vec::new();
+        for i in 0..n {
+            let st = st.clone();
+            enq_handles.push(tokio::task::spawn_blocking(move || {
+                let rel = PathBuf::from(format!("p{i}.md"));
+                let enqueued = st.enqueue_initial_broadcast(rel.clone());
+                (rel, enqueued)
+            }));
+        }
+
+        // 少し遅らせて drain を走らせる (= 1/3 程度の enqueue と race するイメージ)
+        let st_for_drain = st.clone();
+        let drainer = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            assert!(st_for_drain.mark_first_join(), "first join should be observed");
+            st_for_drain.drain_pending_initial()
+        });
+
+        let mut results = Vec::new();
+        for h in enq_handles {
+            results.push(h.await.unwrap());
+        }
+        let drained: HashSet<PathBuf> = drainer.await.unwrap().into_iter().collect();
+
+        // 残骸チェック: drain 完了後、 queue は空であるべき
+        // (= 後続 enqueue は false を返したので入っていない)
+        assert!(
+            st.pending_initial_broadcasts
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "queue must be empty after drain (post-join enqueues take the false path)"
+        );
+
+        // invariant: 各 path について「 drained に居る 」 か 「 enqueue=false 」 の
+        // どちらか。 enqueue=true なのに drained に居ない path は race による
+        // 取り残し = bug。
+        for (rel, enqueued) in &results {
+            let was_drained = drained.contains(rel);
+            let direct = !enqueued;
+            assert!(
+                was_drained || direct,
+                "path {} enqueued=true but not drained -- TOCTOU race",
+                rel.display()
+            );
+        }
     }
 
     /// Phase 3 review M3: status と sender の invariant 違反は constructor で panic。

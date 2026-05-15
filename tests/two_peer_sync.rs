@@ -195,13 +195,11 @@ async fn two_peer_invite_accept_file_sync() {
     .expect("alice allow-peer");
     assert_eq!(ap["added"], true);
 
-    // mesh connection が安定するまで待つ。 gossip plumtree は opportunistic
-    // forward なので、 broadcast 時点で neighbor 未接続だと message が drop され、
-    // file は永遠に伝搬しない。 N0 relay + holepunching で接続 settle まで
-    // 数秒かかるので、 余裕を持って 8s 待つ。
-    tokio::time::sleep(Duration::from_secs(8)).await;
-
-    // (8) Alice 側 watched_dir に file を作る
+    // (8) Alice 側 watched_dir に file を作る (= 即座に)。
+    // 旧 logic では「 gossip neighbor が up する前に broadcast → drop 」 race を
+    // 8s sleep で回避していたが、 H1 review fix で daemon 側に gate + queue を
+    // 入れたので test 側の sleep は不要。 初回 NeighborUp で queue が drain
+    // される設計に依存する形に変えた。
     let alice_watch = alice.watch_dir.path().to_path_buf();
     let bob_watch = bob.watch_dir.path().to_path_buf();
     std::fs::write(alice_watch.join("hello.md"), b"hello from alice").unwrap();

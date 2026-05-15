@@ -35,7 +35,7 @@ use p2p_dir_sync::daemon::state::{DaemonPaths, DaemonState, RuntimeStatus};
 use p2p_dir_sync::keystore;
 use p2p_dir_sync::message::PeerRef;
 use p2p_dir_sync::paths;
-use p2p_dir_sync::receive::{PeerSeenCallback, receive_loop};
+use p2p_dir_sync::receive::{OnNeighborUpCallback, PeerSeenCallback, receive_loop};
 use p2p_dir_sync::runtime::SyncRuntime;
 use p2p_dir_sync::send::{broadcast_tombstone, send_file};
 use p2p_dir_sync::state::{PendingTracker, SyncState};
@@ -219,6 +219,70 @@ async fn main() -> Result<()> {
         let state_for_cb = state.clone();
         let peer_seen_cb: PeerSeenCallback =
             std::sync::Arc::new(move |peer, t| state_for_cb.mark_peer_seen(peer, t));
+
+        // on_neighbor_up callback (= Phase 3 review H1): 初回 NeighborUp で
+        // pending_initial_broadcasts を drain して send_file を発火する。
+        // 2 回目以降の NeighborUp (= peer 追加 / 再接続) では何もしない。
+        let state_for_njup = state.clone();
+        let watched_for_njup = watched_dir.clone();
+        let sender_for_njup = state
+            .gossip_sender_cloned()
+            .context("gossip_sender must be Some when runtime_status = Active")?;
+        let self_peer_for_njup = PeerRef { id: state.self_endpoint_id };
+        let njup_cb: OnNeighborUpCallback = std::sync::Arc::new(move |peer| {
+            if !state_for_njup.mark_first_join() {
+                return; // 既に join 済 = 何もしない
+            }
+            tracing::info!(
+                peer = %peer.fmt_short(),
+                "first gossip neighbor up; flushing pending initial broadcasts"
+            );
+            let pending = state_for_njup.drain_pending_initial();
+            if pending.is_empty() {
+                return;
+            }
+            // tokio::spawn で send_file を逐次呼ぶ (= callback 自体は同期境界)
+            let state = state_for_njup.clone();
+            let watched = watched_for_njup.clone();
+            let sender = sender_for_njup.clone();
+            let self_peer = self_peer_for_njup.clone();
+            tokio::spawn(async move {
+                for rel in pending {
+                    let Some(rel_str) = rel.to_str().map(|s| s.to_string()) else {
+                        continue;
+                    };
+                    let abs_target = watched.join(&rel);
+                    if !abs_target.exists() {
+                        // 既に削除済 = tombstone broadcast
+                        if let Err(e) = broadcast_tombstone(
+                            &rel_str,
+                            &sender,
+                            self_peer.clone(),
+                            &state.sync_state,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                path = %rel_str,
+                                "delayed tombstone broadcast failed: {e:#}"
+                            );
+                        }
+                    } else if let Err(e) = send_file(
+                        &rel_str,
+                        &watched,
+                        &state.blobs,
+                        &sender,
+                        self_peer.clone(),
+                        &state.sync_state,
+                    )
+                    .await
+                    {
+                        tracing::warn!(path = %rel_str, "delayed send_file failed: {e:#}");
+                    }
+                }
+            });
+        });
+
         let allowlist_for_recv = state.allowlist.clone();
         let pending_for_recv = state.pending.clone();
         let state_for_recv = state.sync_state.clone();
@@ -235,6 +299,7 @@ async fn main() -> Result<()> {
                 watched_for_recv,
                 pending_for_recv,
                 Some(peer_seen_cb),
+                Some(njup_cb),
             )
             .await
             {
@@ -261,7 +326,6 @@ async fn main() -> Result<()> {
                 let sender = sender.clone();
                 let self_peer = self_peer.clone();
                 async move {
-                    // event kind が remove なら tombstone broadcast、 それ以外は send_file
                     use notify_debouncer_full::notify::EventKind;
                     let rel_str = match rel.to_str() {
                         Some(s) => s.to_string(),
@@ -271,6 +335,38 @@ async fn main() -> Result<()> {
                         }
                     };
                     let abs_target = watched.join(&rel);
+
+                    // === self-loop 防止: last_written marker を **必ず remove** する
+                    // (= Phase 3 review M2)。 旧 logic は hash 一致時のみ consume だったので、
+                    // hash mismatch / read error で marker が残り後続の正当 edit を
+                    // 誤 suppress する穴があった。 一度 take して、 hash 一致なら suppress、
+                    // 不一致 / read error ならそのまま send 経路へ進む (= one-shot 性確保)。
+                    let prev_hash = state
+                        .sync_state
+                        .last_written
+                        .lock()
+                        .expect("lock")
+                        .remove(&rel);
+                    let suppress_self_loop = if let Some(expected) = prev_hash {
+                        if abs_target.exists() {
+                            match std::fs::read(&abs_target) {
+                                Ok(bytes) => iroh_blobs::Hash::new(&bytes) == expected,
+                                Err(_) => false,
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if suppress_self_loop {
+                        tracing::debug!(
+                            path = %rel_str,
+                            "watcher Modify suppressed (= self-loop, hash match)"
+                        );
+                        return;
+                    }
+
                     if matches!(ev.event.kind, EventKind::Remove(_)) || !abs_target.exists() {
                         // self-loop 防止: last_removed に入っているなら consume + skip
                         let suppress = {
@@ -284,6 +380,16 @@ async fn main() -> Result<()> {
                             );
                             return;
                         }
+
+                        // H1 review fix: 初回 join 待ちなら queue へ
+                        if state.enqueue_initial_broadcast(rel.clone()) {
+                            tracing::debug!(
+                                path = %rel_str,
+                                "queued initial Tombstone (gossip not joined yet)"
+                            );
+                            return;
+                        }
+
                         if let Err(e) =
                             broadcast_tombstone(&rel_str, &sender, self_peer, &state.sync_state)
                                 .await
@@ -291,44 +397,15 @@ async fn main() -> Result<()> {
                             tracing::warn!(path = %rel_str, "broadcast_tombstone failed: {e:#}");
                         }
                     } else {
-                        // self-loop 防止 (= Phase 3 review H2):
-                        // 1. abs_target を read して BLAKE3 hash を計算
-                        // 2. last_written[rel] == hash なら receive 経路が書いた直後の
-                        //    file が watcher で再 broadcast されようとしている →
-                        //    consume + skip。 異なる hash なら user の編集 → broadcast。
-                        // last_written は受信 / 送信 自身どちらでも記録される (=
-                        // self-broadcast の 2 重防止)。
-                        let expected = {
-                            let last = state.sync_state.last_written.lock().expect("lock");
-                            last.get(&rel).copied()
-                        };
-                        if let Some(expected_hash) = expected {
-                            match std::fs::read(&abs_target) {
-                                Ok(bytes) => {
-                                    let current = iroh_blobs::Hash::new(&bytes);
-                                    if current == expected_hash {
-                                        // consume + skip
-                                        let mut last = state
-                                            .sync_state
-                                            .last_written
-                                            .lock()
-                                            .expect("lock");
-                                        last.remove(&rel);
-                                        tracing::debug!(
-                                            path = %rel_str,
-                                            "watcher Modify suppressed (= self-loop, hash match)"
-                                        );
-                                        return;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        path = %rel_str,
-                                        "could not read file for self-loop check: {e}"
-                                    );
-                                }
-                            }
+                        // H1 review fix: 初回 join 待ちなら queue へ
+                        if state.enqueue_initial_broadcast(rel.clone()) {
+                            tracing::debug!(
+                                path = %rel_str,
+                                "queued initial Upsert (gossip not joined yet)"
+                            );
+                            return;
                         }
+
                         if let Err(e) = send_file(
                             &rel_str,
                             &watched,
