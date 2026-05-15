@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  p2p-dir-sync daemon launchd plist template (= design.md §5.4 を実装ベース)。
+
+  install-launchd.sh が `__BIN__` / `__WATCH__` / `__HOME__` を実値に
+  置換して `~/Library/LaunchAgents/com.user.p2p-dir-sync.plist` に書き出す。
+
+  Key 解説:
+  - RunAtLoad=true / KeepAlive=true: boot 時と異常終了時に auto start
+  - ExitTimeOut=15: daemon の 10s graceful budget より 5s 余裕、 超過時 SIGKILL
+  - ThrottleInterval=10: crash loop 防止 (= 起動失敗 → 10s 待って再起動)
+  - StandardOutPath / StandardErrorPath: daemon 本体の file appender とは
+    **別 file** にする (= 重複出力回避、 design.md §5.4 launchd 設定参照)
+  - EnvironmentVariables.HOME: launchd は default で HOME を継承するが、
+    GUI / launchctl bootstrap 経由では薄いので明示で安全側に
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.p2p-dir-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN__</string>
+        <string>--watch</string>
+        <string>__WATCH__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/p2p-dir-sync.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/p2p-dir-sync.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>P2P_SYNC_LOG</key>
+        <string>info,p2p_dir_sync=debug</string>
+    </dict>
+
+    <!--
+      他の常用 key:
+      - ProcessType=Background: 省略可。 macOS が daemon を低優先扱いにする
+      - WorkingDirectory=__HOME__: 一部 system で必要、 default は /
+      - Nice=0: 普通優先度
+    -->
+</dict>
+</plist>
