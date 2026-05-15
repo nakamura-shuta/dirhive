@@ -11,3 +11,6 @@ Cargo.lock.bak
 *~
 /scratch/
 *.local.toml
+
+# 内部メモ
+/internal/

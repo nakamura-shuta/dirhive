@@ -1,6 +1,6 @@
 # dirhive 設計書
 
-> [`requirements.md`](requirements.md) で確定した要件を実装に落とすための設計 plan。
+> 確定済の要件 (= 内部 memo) を実装に落とすための設計 plan。
 >
 > 改版履歴は git log を参照。
 
@@ -57,7 +57,6 @@ dirhive/                        # 独立 repo (jj/git colocated)
 ├── Cargo.toml
 ├── README.md
 ├── docs/
-│   ├── requirements.md
 │   ├── design.md                    # 本 doc
 │   ├── operations.md                # 運用手順 (launchd / plugin install / 復旧)
 │   └── schema/
