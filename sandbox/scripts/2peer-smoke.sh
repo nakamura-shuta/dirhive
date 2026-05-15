@@ -172,6 +172,7 @@ ok "got ticket (${#TICKET} chars)"
 # --- 2. Alice restart → Active --------------------------------------------
 section "2. Alice: restart so gossip subscribes"
 stop_daemon "${ALICE_PID}"
+ALICE_PID=""  # cleanup trap が旧 PID を kill しないよう即時クリア (= L2 review fix)
 spawn_daemon "${ALICE_HOME}" "${ALICE_HOME}/daemon2"
 ALICE_PID="${SPAWN_PID}"
 hc=$(rpc_alice sync.health-check)
@@ -195,6 +196,7 @@ ok "bob accepted (my_peer_id=${BOB_ID:0:12}...)"
 # --- 4. Bob restart → Active ----------------------------------------------
 section "4. Bob: restart so gossip subscribes"
 stop_daemon "${BOB_PID}"
+BOB_PID=""  # cleanup trap が旧 PID を kill しないよう即時クリア (= L2 review fix)
 spawn_daemon "${BOB_HOME}" "${BOB_HOME}/daemon2"
 BOB_PID="${SPAWN_PID}"
 hc=$(rpc_bob sync.health-check)
@@ -209,12 +211,11 @@ added=$(echo "${ap}" | json_field added)
 [[ "${added}" == "True" ]] || fail_msg "alice allow-peer added != True: ${added}"
 ok "alice allowlisted bob"
 
-# --- 6. Alice write file ---------------------------------------------------
-section "6. Alice: write hello.md"
+# --- 6. Alice → Bob direction (= hello.md) --------------------------------
+section "6. Alice → Bob: write hello.md"
 echo -n "hello from alice via 2peer-smoke" > "${ALICE_HOME}/watched/hello.md"
 ok "wrote ${ALICE_HOME}/watched/hello.md"
 
-# --- 7. Bob receives the file ----------------------------------------------
 section "7. Bob: wait for hello.md (max 90s)"
 if wait_for_file "${BOB_HOME}" "hello.md" "hello from alice via 2peer-smoke" 90; then
   ok "hello.md propagated to bob's watched_dir"
@@ -223,11 +224,30 @@ else
   tail -20 "${ALICE_HOME}/daemon2.stderr" | sed 's/^/      /'
   echo "    --- bob daemon2.stderr tail ---"
   tail -20 "${BOB_HOME}/daemon2.stderr"   | sed 's/^/      /'
-  fail_msg "file did not reach bob within 90s"
+  fail_msg "alice→bob: file did not reach bob within 90s"
 fi
 
-# --- 8. tear down ----------------------------------------------------------
-section "8. SIGTERM both daemons"
+# --- 8. Bob → Alice direction (= reply.md、 = M1 review fix) ----------------
+# mesh は対称構造だが、 実装 path (= receive_loop on alice、 blob serve on bob、
+# AllowlistBlobs::on_serve_success callback) が片方向だけ動いて逆方向が壊れる
+# regression を検出するため bilateral 検証する。
+section "8. Bob → Alice: write reply.md"
+echo -n "reply from bob via 2peer-smoke" > "${BOB_HOME}/watched/reply.md"
+ok "wrote ${BOB_HOME}/watched/reply.md"
+
+section "9. Alice: wait for reply.md (max 90s)"
+if wait_for_file "${ALICE_HOME}" "reply.md" "reply from bob via 2peer-smoke" 90; then
+  ok "reply.md propagated to alice's watched_dir"
+else
+  echo "    --- alice daemon2.stderr tail ---"
+  tail -20 "${ALICE_HOME}/daemon2.stderr" | sed 's/^/      /'
+  echo "    --- bob daemon2.stderr tail ---"
+  tail -20 "${BOB_HOME}/daemon2.stderr"   | sed 's/^/      /'
+  fail_msg "bob→alice: reply.md did not reach alice within 90s"
+fi
+
+# --- 10. tear down ---------------------------------------------------------
+section "10. SIGTERM both daemons"
 stop_daemon "${ALICE_PID}"; ALICE_PID=""
 stop_daemon "${BOB_PID}";   BOB_PID=""
 ok "both daemons exited 0 (graceful)"
