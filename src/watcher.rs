@@ -151,6 +151,14 @@ fn path_is_skippable(p: &Path) -> bool {
             {
                 return true;
             }
+            // conflict backup (= `<orig>.conflict-local-<peer8>`) は受信側が
+            // 退避用に作る file (= `compute_conflict_backup_path` in conflict.rs)。
+            // 自 watcher が拾って peer に再 broadcast すると mesh 全体で同 file が
+            // ピンポン状に増殖する (= 各 peer がさらに別 name で backup を作る)。
+            // 抑止するため、 name の途中に `.conflict-local-` を含むものは skip。
+            if name.contains(".conflict-local-") {
+                return true;
+            }
         }
     }
     false
@@ -257,6 +265,32 @@ mod tests {
         assert!(should_skip(&ev(
             modify_any(),
             vec![PathBuf::from("/r/d.md~")]
+        )));
+    }
+
+    /// P0 #1 fix: conflict-local backup は watcher で skip して mesh への
+    /// 再 broadcast (= ピンポン loop) を抑止する。
+    #[test]
+    fn should_skip_conflict_local_backup() {
+        // 通常 case (= `<orig>.conflict-local-<peer8>`)
+        assert!(should_skip(&ev(
+            modify_any(),
+            vec![PathBuf::from("/r/notes.md.conflict-local-abcd1234")]
+        )));
+        // nested dir 配下
+        assert!(should_skip(&ev(
+            modify_any(),
+            vec![PathBuf::from("/r/sub/entry.md.conflict-local-deadbeef")]
+        )));
+        // extension が無い original 名
+        assert!(should_skip(&ev(
+            modify_any(),
+            vec![PathBuf::from("/r/Makefile.conflict-local-feedface")]
+        )));
+        // pattern 不一致 (= 単に "conflict" だけ含む name は skip しない)
+        assert!(!should_skip(&ev(
+            modify_any(),
+            vec![PathBuf::from("/r/conflict-resolution.md")]
         )));
     }
 
