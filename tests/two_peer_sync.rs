@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use p2p_dir_sync::daemon::client::rpc;
+use dirhive::daemon::client::rpc;
 
 struct Daemon {
     child: tokio::process::Child,
@@ -31,17 +31,17 @@ impl Daemon {
     async fn spawn() -> Self {
         let watch_dir = tempfile::TempDir::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
-        let bin = env!("CARGO_BIN_EXE_p2p-sync");
+        let bin = env!("CARGO_BIN_EXE_dirhive");
         let socket = state_dir.path().join("daemon.sock");
 
         let mut cmd = tokio::process::Command::new(bin);
         cmd.arg("--watch")
             .arg(watch_dir.path())
-            .env("P2P_SYNC_STATE_DIR", state_dir.path())
-            .env("P2P_SYNC_CONFIG_DIR", state_dir.path().join("config"))
-            .env("P2P_SYNC_LOG_DIR", state_dir.path().join("logs"))
-            .env("P2P_SYNC_LOG", "warn")
-            .env("P2P_SYNC_LOG", "info,p2p_dir_sync=debug")
+            .env("DIRHIVE_STATE_DIR", state_dir.path())
+            .env("DIRHIVE_CONFIG_DIR", state_dir.path().join("config"))
+            .env("DIRHIVE_LOG_DIR", state_dir.path().join("logs"))
+            .env("DIRHIVE_LOG", "warn")
+            .env("DIRHIVE_LOG", "info,dirhive=debug")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -80,7 +80,7 @@ impl Daemon {
 
     /// 同 state_dir / watch_dir で daemon を再起動 (= invite/accept 後の reboot)。
     async fn restart_in_place(self) -> Daemon {
-        let bin = env!("CARGO_BIN_EXE_p2p-sync");
+        let bin = env!("CARGO_BIN_EXE_dirhive");
         let state_dir = self.state_dir;
         let watch_dir = self.watch_dir;
 
@@ -97,11 +97,11 @@ impl Daemon {
         let mut cmd = tokio::process::Command::new(bin);
         cmd.arg("--watch")
             .arg(watch_dir.path())
-            .env("P2P_SYNC_STATE_DIR", state_dir.path())
-            .env("P2P_SYNC_CONFIG_DIR", state_dir.path().join("config"))
-            .env("P2P_SYNC_LOG_DIR", state_dir.path().join("logs"))
-            .env("P2P_SYNC_LOG", "warn")
-            .env("P2P_SYNC_LOG", "info,p2p_dir_sync=debug")
+            .env("DIRHIVE_STATE_DIR", state_dir.path())
+            .env("DIRHIVE_CONFIG_DIR", state_dir.path().join("config"))
+            .env("DIRHIVE_LOG_DIR", state_dir.path().join("logs"))
+            .env("DIRHIVE_LOG", "warn")
+            .env("DIRHIVE_LOG", "info,dirhive=debug")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -217,11 +217,11 @@ async fn two_peer_invite_accept_file_sync() {
         let alice_log = alice
             .state_dir
             .path()
-            .join("logs/p2p-dir-sync.log");
+            .join("logs/dirhive.log");
         let bob_log = bob
             .state_dir
             .path()
-            .join("logs/p2p-dir-sync.log");
+            .join("logs/dirhive.log");
         let alice_tail = std::fs::read_to_string(&alice_log).unwrap_or_default();
         let bob_tail = std::fs::read_to_string(&bob_log).unwrap_or_default();
         let _ = alice.stop().await;

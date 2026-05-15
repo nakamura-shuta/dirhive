@@ -1,4 +1,4 @@
-//! `p2p-sync` daemon binary の smoke test。
+//! `dirhive` daemon binary の smoke test。
 //!
 //! - daemon を spawn (= --watch + state-dir env override)
 //! - sync.health-check probe で起動完了を確認
@@ -11,29 +11,29 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use p2p_dir_sync::daemon::client::rpc;
+use dirhive::daemon::client::rpc;
 
 /// daemon binary を spawn し、 socket が準備できるまで polling する helper。
 async fn spawn_daemon(
     watched: &std::path::Path,
     state_dir: &std::path::Path,
 ) -> (tokio::process::Child, std::path::PathBuf) {
-    let bin = env!("CARGO_BIN_EXE_p2p-sync");
+    let bin = env!("CARGO_BIN_EXE_dirhive");
     let socket = state_dir.join("daemon.sock");
 
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("--watch")
         .arg(watched)
-        .env("P2P_SYNC_STATE_DIR", state_dir)
-        .env("P2P_SYNC_CONFIG_DIR", state_dir.join("config"))
-        .env("P2P_SYNC_LOG_DIR", state_dir.join("logs"))
-        .env("P2P_SYNC_LOG", "warn") // 静かめ
+        .env("DIRHIVE_STATE_DIR", state_dir)
+        .env("DIRHIVE_CONFIG_DIR", state_dir.join("config"))
+        .env("DIRHIVE_LOG_DIR", state_dir.join("logs"))
+        .env("DIRHIVE_LOG", "warn") // 静かめ
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    let child = cmd.spawn().expect("spawn p2p-sync daemon");
+    let child = cmd.spawn().expect("spawn dirhive daemon");
 
     // socket 出現まで polling (最大 15s)
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -102,7 +102,7 @@ async fn daemon_invite_first_call_sets_restart_required() {
     let v = rpc(&socket, "sync.invite", serde_json::json!({}))
         .await
         .expect("invite rpc");
-    assert!(v["ticket"].as_str().unwrap().starts_with("p2psync1-"));
+    assert!(v["ticket"].as_str().unwrap().starts_with("dirhive1-"));
     assert_eq!(v["restart_required"], true);
 
     // 2 回目: 既存 secret を使うが daemon は再起動してない (=
@@ -130,20 +130,20 @@ async fn daemon_recent_log_reads_actual_file_appender_output() {
     let watch_tmp = tempfile::TempDir::new().unwrap();
     let state_tmp = tempfile::TempDir::new().unwrap();
     let mut child = {
-        let bin = env!("CARGO_BIN_EXE_p2p-sync");
+        let bin = env!("CARGO_BIN_EXE_dirhive");
         let mut cmd = tokio::process::Command::new(bin);
         cmd.arg("--watch")
             .arg(watch_tmp.path())
-            .env("P2P_SYNC_STATE_DIR", state_tmp.path())
-            .env("P2P_SYNC_CONFIG_DIR", state_tmp.path().join("config"))
-            .env("P2P_SYNC_LOG_DIR", state_tmp.path().join("logs"))
+            .env("DIRHIVE_STATE_DIR", state_tmp.path())
+            .env("DIRHIVE_CONFIG_DIR", state_tmp.path().join("config"))
+            .env("DIRHIVE_LOG_DIR", state_tmp.path().join("logs"))
             // 「 endpoint online 」 等の info ログを確実に file に流すため
-            .env("P2P_SYNC_LOG", "info,p2p_dir_sync=debug")
+            .env("DIRHIVE_LOG", "info,dirhive=debug")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        cmd.spawn().expect("spawn p2p-sync")
+        cmd.spawn().expect("spawn dirhive")
     };
 
     let socket = state_tmp.path().join("daemon.sock");
@@ -162,7 +162,7 @@ async fn daemon_recent_log_reads_actual_file_appender_output() {
     assert!(socket.exists(), "daemon did not become ready");
 
     // log file の場所を解決して中身を直接 read してみる (= file appender 動作確認)
-    let log_path = state_tmp.path().join("logs").join("p2p-dir-sync.log");
+    let log_path = state_tmp.path().join("logs").join("dirhive.log");
     assert!(
         log_path.exists(),
         "init_tracing file appender did not create log file at {}",

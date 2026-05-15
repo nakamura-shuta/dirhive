@@ -1,6 +1,6 @@
 //! 受信 change log (= peer から受信した change の中性的な記録)。
 //!
-//! design.md §4.4 / §6.6 参照。`~/.local/share/p2p-dir-sync/pending/<repo_hash>/`
+//! design.md §4.4 / §6.6 参照。`~/.local/share/dirhive/pending/<repo_hash>/`
 //! 配下に entry を 1 file 1 entry で append する。
 
 use std::path::Path;

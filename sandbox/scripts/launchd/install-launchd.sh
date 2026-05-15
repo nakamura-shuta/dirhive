@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# install p2p-dir-sync as a launchd user agent.
+# install dirhive as a launchd user agent.
 #
 # Usage:
 #   install-launchd.sh --watch <DIR> [--bin <PATH>] [--dry-run]
 #
 # Steps:
 #   1. plist の placeholder (__BIN__ / __WATCH__ / __HOME__) を実値に置換
-#   2. ~/Library/LaunchAgents/com.user.p2p-dir-sync.plist に書き出し
+#   2. ~/Library/LaunchAgents/com.user.dirhive.plist に書き出し
 #   3. launchctl bootstrap gui/$UID で boot
 #   4. 状態確認 + 次手順を表示
 #
@@ -26,7 +26,7 @@ usage() {
 usage: $(basename "$0") --watch <DIR> [--bin <PATH>] [--dry-run]
 
   --watch <DIR>   同期対象 dir (= 必須、 canonicalize される)
-  --bin <PATH>    p2p-sync binary の絶対 path (default: \$HOME/.local/bin/p2p-sync)
+  --bin <PATH>    dirhive binary の絶対 path (default: \$HOME/.local/bin/dirhive)
   --dry-run       plist 内容を stdout に出すだけ。 file 設置 / launchctl 実行 skip
   -h, --help      この help
 EOF
@@ -55,7 +55,7 @@ fi
 WATCH_ABS="$(cd "${WATCH_DIR}" && pwd)"
 
 if [[ -z "${BIN_PATH}" ]]; then
-  BIN_PATH="${HOME}/.local/bin/p2p-sync"
+  BIN_PATH="${HOME}/.local/bin/dirhive"
 fi
 if [[ ! -x "${BIN_PATH}" ]]; then
   echo "error: --bin not executable: ${BIN_PATH}" >&2
@@ -81,13 +81,13 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
 fi
 
 # --- install --------------------------------------------------------------
-PLIST_TARGET="${HOME}/Library/LaunchAgents/com.user.p2p-dir-sync.plist"
+PLIST_TARGET="${HOME}/Library/LaunchAgents/com.user.dirhive.plist"
 mkdir -p "${HOME}/Library/LaunchAgents"
 mkdir -p "${HOME}/Library/Logs"
 
-if [[ -f "${PLIST_TARGET}" ]] && launchctl print "gui/${UID}/com.user.p2p-dir-sync" >/dev/null 2>&1; then
+if [[ -f "${PLIST_TARGET}" ]] && launchctl print "gui/${UID}/com.user.dirhive" >/dev/null 2>&1; then
   cat <<EOF >&2
-error: a launchd service is already loaded (gui/${UID}/com.user.p2p-dir-sync).
+error: a launchd service is already loaded (gui/${UID}/com.user.dirhive).
        run sandbox/scripts/launchd/uninstall-launchd.sh first.
 EOF
   exit 1
@@ -111,7 +111,7 @@ fi
 echo
 echo "==> verify"
 sleep 1
-launchctl print "gui/${UID}/com.user.p2p-dir-sync" 2>/dev/null | head -20 | sed 's/^/    /' || true
+launchctl print "gui/${UID}/com.user.dirhive" 2>/dev/null | head -20 | sed 's/^/    /' || true
 
 cat <<EOF
 
@@ -119,14 +119,14 @@ cat <<EOF
 
 Next:
   - watch logs:
-      tail -f ${HOME}/Library/Logs/p2p-dir-sync.stdout.log
-      tail -f ${HOME}/Library/Logs/p2p-dir-sync.stderr.log
+      tail -f ${HOME}/Library/Logs/dirhive.stdout.log
+      tail -f ${HOME}/Library/Logs/dirhive.stderr.log
   - probe daemon:
-      p2p-sync-mcp     # MCP server (for AI agents)
-      python3 sandbox/scripts/lib/rpc.py ${HOME}/.local/share/p2p-dir-sync/daemon.sock sync.health-check
+      dirhive-mcp     # MCP server (for AI agents)
+      python3 sandbox/scripts/lib/rpc.py ${HOME}/.local/share/dirhive/daemon.sock sync.health-check
   - stop:
       sandbox/scripts/launchd/uninstall-launchd.sh
   - restart after invite/accept:
-      launchctl kickstart -k gui/${UID}/com.user.p2p-dir-sync
+      launchctl kickstart -k gui/${UID}/com.user.dirhive
 
 EOF

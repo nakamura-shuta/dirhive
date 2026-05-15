@@ -1,4 +1,4 @@
-//! p2p-dir-sync: 任意 dir の P2P 同期 daemon + MCP server
+//! dirhive: 任意 dir の P2P 同期 daemon + MCP server
 //!
 //! 詳細仕様は [`docs/design.md`](../docs/design.md) を参照。
 //!
@@ -17,12 +17,12 @@
 //! ├── allowlist_blobs.rs  ← blob ALPN allowlist wrap
 //! ├── message.rs          ← SyncUpdate / InviteTicket wire format
 //! ├── keystore.rs         ← endpoint.key + folder-secret.bin 永続化
-//! ├── paths.rs            ← path 規約 (~/.local/share/p2p-dir-sync/)
+//! ├── paths.rs            ← path 規約 (~/.local/share/dirhive/)
 //! ├── pending_log.rs      ← 受信 change log
 //! ├── daemon/             ← Unix socket listener + dispatch + client
 //! └── bin/
-//!     ├── p2p-sync.rs     ← daemon binary
-//!     └── p2p-sync-mcp.rs ← MCP server binary
+//!     ├── dirhive.rs     ← daemon binary
+//!     └── dirhive-mcp.rs ← MCP server binary
 //! ```
 
 // Phase 1 では空 module 宣言のみ。Phase 2 以降で実装する。

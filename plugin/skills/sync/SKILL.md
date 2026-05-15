@@ -3,7 +3,7 @@ name: sync
 description: Use when the user wants to sync a directory with peers via P2P. Triggers on phrases like "sync this dir", "share my notes with bob", "invite a peer", "accept a sync invitation", "what peers do I have", "show sync status".
 ---
 
-# p2p-dir-sync
+# dirhive
 
 This skill exposes a P2P directory sync daemon (running on the local machine) that watches a specified directory and propagates file changes to a small set of trusted peers over Iroh. Use it when the user asks anything related to file sharing between trusted devices/people that is **not** mediated by a centralised cloud.
 
@@ -13,19 +13,19 @@ This is the canonical flow. If the user's intent matches any step, run the corre
 
 ```text
 [Alice]  (daemon running, no folder-secret yet)
-1. /p2p-dir-sync:invite
+1. /dirhive:invite
    → returns {ticket, restart_required: true}
 2. Alice restarts the daemon so it joins the gossip mesh
 3. Alice hands the ticket to Bob out-of-band (Slack, iMessage, ...)
 
 [Bob]  (daemon running, no folder-secret yet)
-4. /p2p-dir-sync:accept <ticket>
+4. /dirhive:accept <ticket>
    → returns {peer_id, my_peer_id, restart_required: true}
 5. Bob restarts the daemon
-6. Bob asks Alice to run /p2p-dir-sync:allow-peer <Bob's my_peer_id>
+6. Bob asks Alice to run /dirhive:allow-peer <Bob's my_peer_id>
 
 [Alice]
-7. /p2p-dir-sync:allow-peer <Bob_id>
+7. /dirhive:allow-peer <Bob_id>
    → bilateral allowlist completed, sync starts
 ```
 
@@ -48,11 +48,11 @@ Forgetting **any** of step 2 / 5 / 6/7 leaves the channel half-open and nothing 
 
 ## Security notes (= things to tell the user)
 
-- The invite ticket starts with `p2psync1-` and contains a `folder_secret`. **Anyone who has the ticket can join the mesh.** Hand it through a trusted channel and treat it as a credential.
+- The invite ticket starts with `dirhive1-` and contains a `folder_secret`. **Anyone who has the ticket can join the mesh.** Hand it through a trusted channel and treat it as a credential.
 - Sync is bilateral: both peers must run `allow-peer` (or `accept-invite`) of the other side. If file changes are not reaching the peer, check both `list-peers` outputs.
 - `last_seen_at == null` for a peer means the data plane has never succeeded. If the user reports "I added bob but nothing happens", that's the first place to look.
 - The daemon does **not** trust the gossip mesh as an adversary boundary — a peer that knows the `folder_secret` can spoof the `from.id` field. The allowlist is a DoS / hygiene layer, not a cryptographic one.
 
 ## Default behaviour
 
-When the user asks `"sync this directory with my other machine"` without further context, walk them through the 7-step bilateral flow. Use the slash commands (`/p2p-dir-sync:invite`, `/p2p-dir-sync:accept`, etc.) so each step is visible in the chat.
+When the user asks `"sync this directory with my other machine"` without further context, walk them through the 7-step bilateral flow. Use the slash commands (`/dirhive:invite`, `/dirhive:accept`, etc.) so each step is visible in the chat.

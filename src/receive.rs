@@ -372,7 +372,7 @@ pub async fn handle_upsert(
     // atomic write (sibling tempfile + persist = POSIX rename)
     let parent = abs.parent().unwrap_or(Path::new("."));
     let mut tmp = tempfile::Builder::new()
-        .prefix(".p2p-sync.")
+        .prefix(".dirhive.")
         .suffix(".tmp")
         .tempfile_in(parent)
         .with_context(|| format!("tempfile_in {}", parent.display()))?;

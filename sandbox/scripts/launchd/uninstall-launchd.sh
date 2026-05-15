@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# uninstall the p2p-dir-sync launchd user agent.
+# uninstall the dirhive launchd user agent.
 #
 # Usage: uninstall-launchd.sh
 #
 # Steps:
-#   1. launchctl bootout gui/$UID/com.user.p2p-dir-sync (= SIGTERM → graceful)
+#   1. launchctl bootout gui/$UID/com.user.dirhive (= SIGTERM → graceful)
 #   2. plist file 削除
 #
 # Idempotent: 何度実行しても 0 exit、 既に bootout 済 / plist 不在でも error なし。
 
 set -euo pipefail
 
-LABEL="com.user.p2p-dir-sync"
+LABEL="com.user.dirhive"
 PLIST_TARGET="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 
 # --- bootout --------------------------------------------------------------
@@ -40,8 +40,8 @@ cat <<EOF
 
 Note:
   - daemon process が居なくなるまで 数 s 〜 15 s かかります (= ExitTimeOut=15)。
-  - daemon 自身が write した state 系 file (~/.local/share/p2p-dir-sync/,
-    ~/.config/p2p-dir-sync/, ~/Library/Logs/p2p-dir-sync.*.log) は残っています。
+  - daemon 自身が write した state 系 file (~/.local/share/dirhive/,
+    ~/.config/dirhive/, ~/Library/Logs/dirhive.*.log) は残っています。
     削除する場合は plugin/README.md "Uninstall" セクションを参照。
 
 EOF

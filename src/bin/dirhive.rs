@@ -1,4 +1,4 @@
-//! p2p-sync daemon binary (= L2 daemon、 design.md §5.1)。
+//! dirhive daemon binary (= L2 daemon、 design.md §5.1)。
 //!
 //! ## 起動シーケンス (= design §5.1 の順序を遵守)
 //!
@@ -27,26 +27,26 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use p2p_dir_sync::allowlist::AllowList;
-use p2p_dir_sync::bootstrap_peers;
-use p2p_dir_sync::daemon::dispatch::Dispatcher;
-use p2p_dir_sync::daemon::listener::{
+use dirhive::allowlist::AllowList;
+use dirhive::bootstrap_peers;
+use dirhive::daemon::dispatch::Dispatcher;
+use dirhive::daemon::listener::{
     DynDispatcher, acquire_daemon_lock, bind_listener_with_lock, probe_existing_socket,
 };
-use p2p_dir_sync::daemon::state::{DaemonPaths, DaemonState, RuntimeStatus};
-use p2p_dir_sync::keystore;
-use p2p_dir_sync::message::PeerRef;
-use p2p_dir_sync::paths;
-use p2p_dir_sync::receive::{OnNeighborUpCallback, PeerSeenCallback, receive_loop};
-use p2p_dir_sync::runtime::SyncRuntime;
-use p2p_dir_sync::send::{broadcast_tombstone, send_file};
-use p2p_dir_sync::state::{PendingTracker, SyncState};
-use p2p_dir_sync::watcher::{WatcherBackend, spawn_watcher, watcher_loop};
+use dirhive::daemon::state::{DaemonPaths, DaemonState, RuntimeStatus};
+use dirhive::keystore;
+use dirhive::message::PeerRef;
+use dirhive::paths;
+use dirhive::receive::{OnNeighborUpCallback, PeerSeenCallback, receive_loop};
+use dirhive::runtime::SyncRuntime;
+use dirhive::send::{broadcast_tombstone, send_file};
+use dirhive::state::{PendingTracker, SyncState};
+use dirhive::watcher::{WatcherBackend, spawn_watcher, watcher_loop};
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
-#[command(name = "p2p-sync", version, about = "P2P directory sync daemon")]
+#[command(name = "dirhive", version, about = "P2P directory sync daemon")]
 struct Cli {
     /// 同期対象 dir (= canonicalize される、 既存である必要)
     #[arg(long, value_name = "DIR")]
@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
     let mark_peer_seen_slot: Arc<std::sync::OnceLock<Arc<DaemonState>>> =
         Arc::new(std::sync::OnceLock::new());
     let slot_for_cb = mark_peer_seen_slot.clone();
-    let serve_cb: p2p_dir_sync::allowlist_blobs::BlobServeCallback =
+    let serve_cb: dirhive::allowlist_blobs::BlobServeCallback =
         Arc::new(move |peer, t| {
             if let Some(state) = slot_for_cb.get() {
                 state.mark_peer_seen(peer, t);
@@ -487,8 +487,8 @@ fn build_daemon_paths(watched_dir: &Path) -> Result<DaemonPaths> {
 /// sync.recent-log が log_path を tail するので、 launchd で stderr redirect しない
 /// 環境 (= binary 直起動 / integration test) でも log entry が file に残る。
 fn init_tracing(log_path: &Path) -> Result<()> {
-    let filter = EnvFilter::try_from_env("P2P_SYNC_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("info,p2p_dir_sync=debug"));
+    let filter = EnvFilter::try_from_env("DIRHIVE_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("info,dirhive=debug"));
 
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)

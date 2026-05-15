@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""MCP stdio probe for p2p-sync-mcp.
+"""MCP stdio probe for dirhive-mcp.
 
 Spawns the MCP server, walks the standard handshake, then exercises
 `sync.ping` (= local, no daemon) and `sync.health-check` (= via daemon RPC).
 Exit code 0 on all-pass, 1 on any assertion failure.
 
 Usage:
-    python3 mcp_probe.py /path/to/p2p-sync-mcp
+    python3 mcp_probe.py /path/to/dirhive-mcp
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ RECV_TIMEOUT_SECS = 20.0
 
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
-        print(f"usage: {argv[0]} /path/to/p2p-sync-mcp", file=sys.stderr)
+        print(f"usage: {argv[0]} /path/to/dirhive-mcp", file=sys.stderr)
         return 2
     bin_path = argv[1]
     if not os.path.isfile(bin_path) or not os.access(bin_path, os.X_OK):
@@ -37,7 +37,7 @@ def main(argv: list[str]) -> int:
 
     env = os.environ.copy()
     # 落ち着いた log level (= stderr が大量に出ないように)
-    env.setdefault("P2P_SYNC_LOG", "warn")
+    env.setdefault("DIRHIVE_LOG", "warn")
 
     proc = subprocess.Popen(
         [bin_path],

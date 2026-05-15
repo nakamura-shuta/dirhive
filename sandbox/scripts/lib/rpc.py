@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send 1 RPC to a p2p-sync daemon Unix socket and print `result` as JSON.
+"""Send 1 RPC to a dirhive daemon Unix socket and print `result` as JSON.
 
 Usage:
     rpc.py <socket_path> <method> [<json_params>]

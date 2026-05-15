@@ -1,18 +1,18 @@
 //! 永続化 path 規約 (design.md §4.5)。
 //!
 //! 全 path は `$HOME` 経由で resolve。test override 用に env var を許す:
-//! - `P2P_SYNC_STATE_DIR`: state dir prefix (default `~/.local/share/p2p-dir-sync`)
-//! - `P2P_SYNC_CONFIG_DIR`: config dir prefix (default `~/.config/p2p-dir-sync`)
-//! - `P2P_SYNC_LOG_DIR`: log dir prefix (default `~/Library/Logs`)
+//! - `DIRHIVE_STATE_DIR`: state dir prefix (default `~/.local/share/dirhive`)
+//! - `DIRHIVE_CONFIG_DIR`: config dir prefix (default `~/.config/dirhive`)
+//! - `DIRHIVE_LOG_DIR`: log dir prefix (default `~/Library/Logs`)
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
-const STATE_DIR_ENV: &str = "P2P_SYNC_STATE_DIR";
-const CONFIG_DIR_ENV: &str = "P2P_SYNC_CONFIG_DIR";
-const LOG_DIR_ENV: &str = "P2P_SYNC_LOG_DIR";
+const STATE_DIR_ENV: &str = "DIRHIVE_STATE_DIR";
+const CONFIG_DIR_ENV: &str = "DIRHIVE_CONFIG_DIR";
+const LOG_DIR_ENV: &str = "DIRHIVE_LOG_DIR";
 
 fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
@@ -24,14 +24,14 @@ fn state_dir() -> Result<PathBuf> {
     if let Some(v) = std::env::var_os(STATE_DIR_ENV) {
         return Ok(PathBuf::from(v));
     }
-    Ok(home_dir()?.join(".local/share/p2p-dir-sync"))
+    Ok(home_dir()?.join(".local/share/dirhive"))
 }
 
 fn config_dir() -> Result<PathBuf> {
     if let Some(v) = std::env::var_os(CONFIG_DIR_ENV) {
         return Ok(PathBuf::from(v));
     }
-    Ok(home_dir()?.join(".config/p2p-dir-sync"))
+    Ok(home_dir()?.join(".config/dirhive"))
 }
 
 fn log_dir() -> Result<PathBuf> {
@@ -76,7 +76,7 @@ pub fn default_key_path() -> Result<PathBuf> {
 }
 
 pub fn default_log_path() -> Result<PathBuf> {
-    Ok(log_dir()?.join("p2p-dir-sync.log"))
+    Ok(log_dir()?.join("dirhive.log"))
 }
 
 /// 親 dir を 0o700 で作成。既存なら mode を 0o700 に再強制する (= umask 非依存)。

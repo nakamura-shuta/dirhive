@@ -1,6 +1,6 @@
-# p2p-dir-sync plugin
+# dirhive plugin
 
-Claude Code / Codex plugin that wraps the `p2p-sync` daemon and the `p2p-sync-mcp`
+Claude Code / Codex plugin that wraps the `dirhive` daemon and the `dirhive-mcp`
 MCP server. Lets an AI agent run the canonical 7-step bilateral invite flow and
 inspect the daemon state without leaving the chat.
 
@@ -38,7 +38,7 @@ plugin/
 ./verify.sh
 ```
 
-`install.sh` builds `p2p-sync` and `p2p-sync-mcp` in `--release` mode and
+`install.sh` builds `dirhive` and `dirhive-mcp` in `--release` mode and
 copies them to `~/.local/bin/`. `verify.sh` then checks that the binaries are
 on `PATH`, all manifest files are present, the command declared in `.mcp.json`
 is resolvable, and (best-effort) the daemon socket responds.
@@ -47,7 +47,7 @@ After installing, point your AI agent at this directory:
 
 ```sh
 # Claude Code
-/plugin install path/to/p2p-dir-sync/plugin
+/plugin install path/to/dirhive/plugin
 
 # Codex
 # Use the .codex-plugin/plugin.json manifest per Codex CLI docs.
@@ -57,14 +57,14 @@ After installing, point your AI agent at this directory:
 
 | command | what it does |
 |---|---|
-| `/p2p-dir-sync:setup-doctor` | 4-step probe (ping → health-check → status → recent-log) |
-| `/p2p-dir-sync:status` | One-shot summary of peer count, uptime, group state |
-| `/p2p-dir-sync:invite` | Generate or re-show your invite ticket |
-| `/p2p-dir-sync:accept <ticket> [label]` | Accept a peer's invite ticket |
-| `/p2p-dir-sync:allow-peer <peer_id> [label]` | Add the counter-half of the bilateral allowlist |
-| `/p2p-dir-sync:peers` | List allowed peers with `last_seen_at` |
-| `/p2p-dir-sync:revoke <peer_id>` | Remove a peer from the local allowlist |
-| `/p2p-dir-sync:pending [limit]` | Show recent incoming change log |
+| `/dirhive:setup-doctor` | 4-step probe (ping → health-check → status → recent-log) |
+| `/dirhive:status` | One-shot summary of peer count, uptime, group state |
+| `/dirhive:invite` | Generate or re-show your invite ticket |
+| `/dirhive:accept <ticket> [label]` | Accept a peer's invite ticket |
+| `/dirhive:allow-peer <peer_id> [label]` | Add the counter-half of the bilateral allowlist |
+| `/dirhive:peers` | List allowed peers with `last_seen_at` |
+| `/dirhive:revoke <peer_id>` | Remove a peer from the local allowlist |
+| `/dirhive:pending [limit]` | Show recent incoming change log |
 
 ## The 7-step bilateral invite flow (= the design.md §3.4 canon)
 
@@ -72,13 +72,13 @@ Run from each side's AI agent:
 
 ```text
 [Alice]                                        [Bob]
-1. /p2p-dir-sync:invite       → ticket
+1. /dirhive:invite       → ticket
 2. (restart alice's daemon)
-3. (hand ticket to bob)        → → →           4. /p2p-dir-sync:accept <ticket>
+3. (hand ticket to bob)        → → →           4. /dirhive:accept <ticket>
                                                   → records bob's my_peer_id
                                                5. (restart bob's daemon)
                                                6. (tell alice my_peer_id)
-7. /p2p-dir-sync:allow-peer <bob_id>           ← ← ←
+7. /dirhive:allow-peer <bob_id>           ← ← ←
 
 sync is now bilateral; alice ↔ bob will sync the watched dirs.
 ```
@@ -88,26 +88,26 @@ Forgetting any of step 2 / 5 / 7 leaves the channel half-open. The plugin's
 
 ## Security notes
 
-- The invite ticket (`p2psync1-...`) contains the `folder_secret` — anyone with
+- The invite ticket (`dirhive1-...`) contains the `folder_secret` — anyone with
   the ticket can join the mesh. Treat it as a credential.
 - The daemon enforces a per-peer allowlist for blob fetch (= AllowlistBlobs in
   `src/allowlist_blobs.rs`) and a `from.id` allowlist for gossip receive. **Both
   are DoS / hygiene layers, not cryptographic identity** — design.md §6.3 calls
   this out.
-- `~/Library/Logs/p2p-dir-sync.log` redacts `p2psync1-...` envelopes and 32+
-  char hex tokens before exposing log lines through `/p2p-dir-sync:setup-doctor`
+- `~/Library/Logs/dirhive.log` redacts `dirhive1-...` envelopes and 32+
+  char hex tokens before exposing log lines through `/dirhive:setup-doctor`
   step 4.
 
 ## Uninstall
 
 ```sh
-rm ~/.local/bin/p2p-sync ~/.local/bin/p2p-sync-mcp
-rm -rf ~/.local/share/p2p-dir-sync ~/.config/p2p-dir-sync
+rm ~/.local/bin/dirhive ~/.local/bin/dirhive-mcp
+rm -rf ~/.local/share/dirhive ~/.config/dirhive
 # launchd users:
-launchctl bootout gui/$UID/com.user.p2p-dir-sync || true
-rm ~/Library/LaunchAgents/com.user.p2p-dir-sync.plist
+launchctl bootout gui/$UID/com.user.dirhive || true
+rm ~/Library/LaunchAgents/com.user.dirhive.plist
 ```
 
-Removing `~/.local/share/p2p-dir-sync` wipes the group identity (= folder
+Removing `~/.local/share/dirhive` wipes the group identity (= folder
 secret), allowlist, blobs, and the change log. The plugin scripts and slash
 commands are stateless and live alongside this directory.

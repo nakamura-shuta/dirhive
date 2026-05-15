@@ -1,4 +1,4 @@
-//! p2p-sync-mcp MCP server binary (= L3、 design.md §3.3)。
+//! dirhive-mcp MCP server binary (= L3、 design.md §3.3)。
 //!
 //! 10 tool: sync.ping (= MCP server 内で完結) + sync.* 9 個 (= daemon Unix socket
 //! へ rpc() を投げる薄い wrapper)。 stdio transport (= Claude Code / Codex plugin)。
@@ -8,12 +8,12 @@
 //! - sync.health-check: daemon が落ちている / 設定不全 の検出
 //!
 //! 設定:
-//! - socket_path: env `P2P_SYNC_SOCKET` で override、 default は paths::default_socket_path
+//! - socket_path: env `DIRHIVE_SOCKET` で override、 default は paths::default_socket_path
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use p2p_dir_sync::daemon::client::rpc;
+use dirhive::daemon::client::rpc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content};
@@ -62,7 +62,7 @@ impl P2pSyncMcp {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AcceptInviteParams {
-    /// `p2psync1-` envelope の invite ticket
+    /// `dirhive1-` envelope の invite ticket
     pub ticket: String,
     /// 表示名 (= sync.list-peers でこの peer 識別に使う)
     #[serde(default)]
@@ -212,14 +212,14 @@ impl ServerHandler for P2pSyncMcp {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let socket_path = match std::env::var_os("P2P_SYNC_SOCKET") {
+    let socket_path = match std::env::var_os("DIRHIVE_SOCKET") {
         Some(s) => PathBuf::from(s),
-        None => p2p_dir_sync::paths::default_socket_path()?,
+        None => dirhive::paths::default_socket_path()?,
     };
 
     // stderr に minimal init message (= stdio は MCP protocol で占有)
     eprintln!(
-        "p2p-sync-mcp v{} starting (socket = {})",
+        "dirhive-mcp v{} starting (socket = {})",
         env!("CARGO_PKG_VERSION"),
         socket_path.display()
     );

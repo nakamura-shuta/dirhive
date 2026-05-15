@@ -1,8 +1,8 @@
 [package]
-name = "p2p-dir-sync"
+name = "dirhive"
 version = "0.1.0"
 edition = "2024"
-description = "P2P directory sync daemon + MCP server"
+description = "P2P directory sync daemon + MCP server (= small-circle bilateral invite mesh)"
 license = "MIT"
 
 # ------------------------------------------------------------------------
@@ -35,7 +35,7 @@ iroh-tickets = "1.0.0-rc.0"
 notify = "8.2.0"
 notify-debouncer-full = "0.7"
 rand = "0.10"
-# MCP server framework (= bin/p2p-sync-mcp.rs)
+# MCP server framework (= bin/dirhive-mcp.rs)
 rmcp = { version = "1.7", features = ["transport-io"] }
 schemars = "1"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -51,9 +51,9 @@ libc = "0.2"
 serial_test = "3"
 
 [[bin]]
-name = "p2p-sync"
-path = "src/bin/p2p-sync.rs"
+name = "dirhive"
+path = "src/bin/dirhive.rs"
 
 [[bin]]
-name = "p2p-sync-mcp"
-path = "src/bin/p2p-sync-mcp.rs"
+name = "dirhive-mcp"
+path = "src/bin/dirhive-mcp.rs"

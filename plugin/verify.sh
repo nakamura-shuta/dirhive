@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# p2p-dir-sync plugin: verify script
+# dirhive plugin: verify script
 #
 # Quick sanity-check after install.sh:
 #   1. binaries are on PATH
@@ -41,8 +41,8 @@ check_bin() {
 }
 
 echo "==> 1. binaries on PATH"
-check_bin p2p-sync
-check_bin p2p-sync-mcp
+check_bin dirhive
+check_bin dirhive-mcp
 
 echo
 echo "==> 2. plugin manifest files"
@@ -61,7 +61,7 @@ mcp_cmd=$(python3 -c '
 import json, sys
 with open(sys.argv[1]) as f:
     j = json.load(f)
-print(j["mcpServers"]["p2p-dir-sync"]["command"])
+print(j["mcpServers"]["dirhive"]["command"])
 ' "${PLUGIN_DIR}/.mcp.json" 2>/dev/null || true)
 
 if [[ -z "${mcp_cmd}" ]]; then
@@ -87,7 +87,7 @@ fi
 
 echo
 echo "==> 4. daemon socket / health-check (best-effort)"
-SOCK="${HOME}/.local/share/p2p-dir-sync/daemon.sock"
+SOCK="${HOME}/.local/share/dirhive/daemon.sock"
 if [[ -S "${SOCK}" ]]; then
   grn "    ✓ ${SOCK} exists"
   # Try a real RPC if `nc -U` is around.

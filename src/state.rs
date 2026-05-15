@@ -2,7 +2,7 @@
 //!
 //! - `SyncState`: receive ↔ watcher の self-loop 防止に使う in-memory state
 //!   (pending_written / last_written / last_removed / recently_broadcast_tombstones)
-//! - `PendingTracker`: P2P 受信 file を `~/.local/share/p2p-dir-sync/pending/<repo_hash>/`
+//! - `PendingTracker`: P2P 受信 file を `~/.local/share/dirhive/pending/<repo_hash>/`
 //!   に記録するための pre-resolved context
 
 use std::collections::{HashMap, HashSet};
@@ -51,7 +51,7 @@ impl SyncState {
 
 /// 受信 file ごとに pending log を書き出すための pre-resolved context。
 ///
-/// `pending_root` (= `~/.local/share/p2p-dir-sync/pending`) と `repo_hash` (out_dir
+/// `pending_root` (= `~/.local/share/dirhive/pending`) と `repo_hash` (out_dir
 /// realpath の BLAKE3 16 hex) を daemon 起動時に 1 度だけ計算して保持し、
 /// receive 経路で毎回 alloc する負荷を避ける。
 #[derive(Debug)]
@@ -161,12 +161,12 @@ mod tests {
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
         unsafe {
-            std::env::set_var("P2P_SYNC_STATE_DIR", &state);
+            std::env::set_var("DIRHIVE_STATE_DIR", &state);
         }
         let tracker = PendingTracker::new(&out).unwrap();
         assert_eq!(tracker.repo_hash.len(), 16);
         unsafe {
-            std::env::remove_var("P2P_SYNC_STATE_DIR");
+            std::env::remove_var("DIRHIVE_STATE_DIR");
         }
     }
 

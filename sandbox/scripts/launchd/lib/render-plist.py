@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Render the p2p-dir-sync launchd plist using `plistlib`.
+"""Render the dirhive launchd plist using `plistlib`.
 
 Usage:
     render-plist.py <HOME> <BIN_PATH> <WATCH_DIR>
 
 stdout = the rendered plist XML (= ready to write to
-`~/Library/LaunchAgents/com.user.p2p-dir-sync.plist`).
+`~/Library/LaunchAgents/com.user.dirhive.plist`).
 
 Why `plistlib` instead of sed-substituting a template (= Phase 5 review H1):
 - A path containing `&` makes `sed` interpret it as "the matched text",
@@ -21,7 +21,7 @@ import plistlib
 import sys
 
 
-LABEL = "com.user.p2p-dir-sync"
+LABEL = "com.user.dirhive"
 
 
 def main(argv: list[str]) -> int:
@@ -44,12 +44,12 @@ def main(argv: list[str]) -> int:
         # crash loop 防止 (= 起動失敗時 10s 待って再起動)
         "ThrottleInterval": 10,
         # launchd の stdout/stderr redirect 先。 daemon 本体の file appender
-        # (= ~/Library/Logs/p2p-dir-sync.log) とは **別 file** にする。
-        "StandardOutPath": f"{home}/Library/Logs/p2p-dir-sync.stdout.log",
-        "StandardErrorPath": f"{home}/Library/Logs/p2p-dir-sync.stderr.log",
+        # (= ~/Library/Logs/dirhive.log) とは **別 file** にする。
+        "StandardOutPath": f"{home}/Library/Logs/dirhive.stdout.log",
+        "StandardErrorPath": f"{home}/Library/Logs/dirhive.stderr.log",
         "EnvironmentVariables": {
             "HOME": home,
-            "P2P_SYNC_LOG": "info,p2p_dir_sync=debug",
+            "DIRHIVE_LOG": "info,dirhive=debug",
         },
     }
 

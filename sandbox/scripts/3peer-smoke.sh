@@ -51,9 +51,9 @@ test -f "${RPC_PY}"
 
 # --- setup tmp HOMEs ------------------------------------------------------
 # AF_UNIX sun_path 104 byte 上限を避けるため `/tmp/...` 直下。
-ALICE_HOME=$(mktemp -d /tmp/p2p-alice.XXXXXX)
-BOB_HOME=$(mktemp -d /tmp/p2p-bob.XXXXXX)
-CAROL_HOME=$(mktemp -d /tmp/p2p-carol.XXXXXX)
+ALICE_HOME=$(mktemp -d /tmp/dirhive-alice.XXXXXX)
+BOB_HOME=$(mktemp -d /tmp/dirhive-bob.XXXXXX)
+CAROL_HOME=$(mktemp -d /tmp/dirhive-carol.XXXXXX)
 mkdir -p "${ALICE_HOME}/watched" "${BOB_HOME}/watched" "${CAROL_HOME}/watched"
 ORIG_HOME="${HOME}"
 
@@ -87,11 +87,11 @@ spawn_daemon() {
     PATH="${home}/.local/bin:${MIN_PATH}" \
     TMPDIR=/tmp \
     TERM="${TERM:-xterm-256color}" \
-    P2P_SYNC_LOG="info,p2p_dir_sync=debug" \
-    "${home}/.local/bin/p2p-sync" --watch "${home}/watched" \
+    DIRHIVE_LOG="info,dirhive=debug" \
+    "${home}/.local/bin/dirhive" --watch "${home}/watched" \
     >"${log}.stdout" 2>"${log}.stderr" &
   SPAWN_PID=$!
-  local sock="${home}/.local/share/p2p-dir-sync/daemon.sock"
+  local sock="${home}/.local/share/dirhive/daemon.sock"
   for _ in $(seq 1 60); do
     if [[ -S "${sock}" ]] && \
         python3 "${RPC_PY}" "${sock}" sync.health-check >/dev/null 2>&1; then
@@ -127,7 +127,7 @@ wait_for_file() {
   return 1
 }
 
-rpc_to_home() { python3 "${RPC_PY}" "$1/.local/share/p2p-dir-sync/daemon.sock" "${@:2}"; }
+rpc_to_home() { python3 "${RPC_PY}" "$1/.local/share/dirhive/daemon.sock" "${@:2}"; }
 rpc_alice() { rpc_to_home "${ALICE_HOME}" "$@"; }
 rpc_bob()   { rpc_to_home "${BOB_HOME}"   "$@"; }
 rpc_carol() { rpc_to_home "${CAROL_HOME}" "$@"; }
@@ -154,8 +154,8 @@ fi
 section "0b. copy binaries to bob / carol HOME"
 for H in "${BOB_HOME}" "${CAROL_HOME}"; do
   mkdir -p "${H}/.local/bin"
-  cp -f "${ALICE_HOME}/.local/bin/p2p-sync"     "${H}/.local/bin/"
-  cp -f "${ALICE_HOME}/.local/bin/p2p-sync-mcp" "${H}/.local/bin/"
+  cp -f "${ALICE_HOME}/.local/bin/dirhive"     "${H}/.local/bin/"
+  cp -f "${ALICE_HOME}/.local/bin/dirhive-mcp" "${H}/.local/bin/"
   chmod 0755 "${H}/.local/bin/"*
 done
 ok "binaries copied to bob + carol"
@@ -166,7 +166,7 @@ spawn_daemon "${ALICE_HOME}" "${ALICE_HOME}/daemon1"
 ALICE_PID="${SPAWN_PID}"
 invite_resp=$(rpc_alice sync.invite)
 TICKET=$(echo "${invite_resp}" | json_field ticket)
-[[ "${TICKET}" == p2psync1-* ]] || fail_msg "ticket prefix wrong"
+[[ "${TICKET}" == dirhive1-* ]] || fail_msg "ticket prefix wrong"
 ok "got ticket (${#TICKET} chars)"
 
 # --- 2. Alice restart → Active --------------------------------------------

@@ -1,10 +1,10 @@
 {
   "mcpServers": {
-    "p2p-dir-sync": {
-      "command": "p2p-sync-mcp",
+    "dirhive": {
+      "command": "dirhive-mcp",
       "args": [],
       "env": {
-        "P2P_SYNC_LOG": "info"
+        "DIRHIVE_LOG": "info"
       }
     }
   }

@@ -310,17 +310,17 @@ fn tail_lines_redacted(log_path: &std::path::Path, n: usize) -> Result<Vec<Strin
     Ok(lines)
 }
 
-/// `p2psync1-` envelope と 32+ 文字の連続 hex token を `<redacted>` に置換。
+/// `dirhive1-` envelope と 32+ 文字の連続 hex token を `<redacted>` に置換。
 ///
 /// design §6.2 の secret 漏洩防止 layer:
-/// - `p2psync1-` envelope: invite ticket (= folder_secret を含む) 漏れ防止
+/// - `dirhive1-` envelope: invite ticket (= folder_secret を含む) 漏れ防止
 /// - 32+ hex token: endpoint key / folder_secret / blob hash 等の長 hex 漏れ防止
 ///
 /// 完全な検査は難しいので「 design で機密と決めた prefix / 長 hex 」 を粗く隠す。
 /// 短い hex (= blob short id 等) は保つ (= debug log の useful information を残す)。
 fn redact_secrets(line: impl AsRef<str>) -> String {
     let s = line.as_ref();
-    let s = redact_pattern(s, "p2psync1-");
+    let s = redact_pattern(s, "dirhive1-");
     redact_hex_token(&s, MIN_REDACT_HEX_LEN)
 }
 
@@ -410,7 +410,7 @@ mod tests {
             folder_secret_path: state_tmp.path().join("folder-secret.bin"),
             key_path: state_tmp.path().join("endpoint.key"),
             blobs_dir: state_tmp.path().join("blobs"),
-            log_path: state_tmp.path().join("p2p-dir-sync.log"),
+            log_path: state_tmp.path().join("dirhive.log"),
             bootstrap_peers_path: state_tmp.path().join("bootstrap-peers.json"),
         };
 
@@ -509,7 +509,7 @@ mod tests {
     async fn invite_first_call_generates_secret_and_sets_restart_required() {
         let (d, _s, _w) = build_dispatcher(0x14, false).await;
         let v = d.invite().await.unwrap();
-        assert!(v["ticket"].as_str().unwrap().starts_with("p2psync1-"));
+        assert!(v["ticket"].as_str().unwrap().starts_with("dirhive1-"));
         assert_eq!(v["restart_required"], true);
 
         // 2 回目: 既存 secret を使うが、 daemon 自身は InitializedButNotSubscribed
@@ -674,8 +674,8 @@ mod tests {
 
     #[test]
     fn redact_pattern_replaces_token_in_text() {
-        let s = "got ticket p2psync1-ABC123XYZ for bob";
-        let r = redact_pattern(s, "p2psync1-");
+        let s = "got ticket dirhive1-ABC123XYZ for bob";
+        let r = redact_pattern(s, "dirhive1-");
         assert!(r.contains("<redacted>"));
         assert!(!r.contains("ABC123XYZ"));
         assert!(r.contains("for bob"));
@@ -710,10 +710,10 @@ mod tests {
         assert_eq!(r, s);
     }
 
-    /// redact_secrets 統合 path: p2psync1- envelope と長 hex の両方が消える。
+    /// redact_secrets 統合 path: dirhive1- envelope と長 hex の両方が消える。
     #[test]
     fn redact_secrets_handles_both_patterns() {
-        let s = "warn invite=p2psync1-AAAABBBBCCCC then hash=00112233445566778899aabbccddeeff00112233";
+        let s = "warn invite=dirhive1-AAAABBBBCCCC then hash=00112233445566778899aabbccddeeff00112233";
         let r = redact_secrets(s);
         assert!(!r.contains("AAAABBBBCCCC"));
         assert!(!r.contains("00112233445566778899aabbccddeeff00112233"));
@@ -734,7 +734,7 @@ mod tests {
         let p: PathBuf = tmp.path().join("p2p.log");
         std::fs::write(
             &p,
-            "line1\nline2 p2psync1-SECRET more\nline3\nline4\nline5\n",
+            "line1\nline2 dirhive1-SECRET more\nline3\nline4\nline5\n",
         )
         .unwrap();
         let v = tail_lines_redacted(&p, 3).unwrap();

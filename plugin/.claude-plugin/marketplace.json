@@ -1,7 +1,7 @@
 {
-  "name": "p2p-dir-sync",
+  "name": "dirhive",
   "owner": {
-    "name": "p2p-dir-sync"
+    "name": "dirhive"
   },
   "metadata": {
     "description": "P2P directory sync between trusted peers, with bilateral invite flow.",
@@ -9,7 +9,7 @@
   },
   "plugins": [
     {
-      "name": "p2p-dir-sync",
+      "name": "dirhive",
       "source": "./",
       "description": "Sync a watched directory with peers over Iroh P2P",
       "keywords": [

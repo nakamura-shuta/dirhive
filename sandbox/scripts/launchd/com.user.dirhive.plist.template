@@ -2,10 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  p2p-dir-sync daemon launchd plist template (= design.md §5.4 を実装ベース)。
+  dirhive daemon launchd plist template (= design.md §5.4 を実装ベース)。
 
   install-launchd.sh が `__BIN__` / `__WATCH__` / `__HOME__` を実値に
-  置換して `~/Library/LaunchAgents/com.user.p2p-dir-sync.plist` に書き出す。
+  置換して `~/Library/LaunchAgents/com.user.dirhive.plist` に書き出す。
 
   Key 解説:
   - RunAtLoad=true / KeepAlive=true: boot 時と異常終了時に auto start
@@ -19,7 +19,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.p2p-dir-sync</string>
+    <string>com.user.dirhive</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -39,16 +39,16 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>__HOME__/Library/Logs/p2p-dir-sync.stdout.log</string>
+    <string>__HOME__/Library/Logs/dirhive.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>__HOME__/Library/Logs/p2p-dir-sync.stderr.log</string>
+    <string>__HOME__/Library/Logs/dirhive.stderr.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
         <string>__HOME__</string>
-        <key>P2P_SYNC_LOG</key>
-        <string>info,p2p_dir_sync=debug</string>
+        <key>DIRHIVE_LOG</key>
+        <string>info,dirhive=debug</string>
     </dict>
 
     <!--

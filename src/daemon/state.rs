@@ -335,7 +335,7 @@ mod tests {
             folder_secret_path: tmp.join("folder-secret.bin"),
             key_path: tmp.join("endpoint.key"),
             blobs_dir: tmp.join("blobs"),
-            log_path: tmp.join("p2p-dir-sync.log"),
+            log_path: tmp.join("dirhive.log"),
             bootstrap_peers_path: tmp.join("bootstrap-peers.json"),
         }
     }

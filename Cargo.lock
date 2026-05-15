@@ -860,6 +860,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirhive"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base32",
+ "base64",
+ "blake3",
+ "clap",
+ "futures-lite",
+ "iroh",
+ "iroh-base",
+ "iroh-blobs",
+ "iroh-gossip",
+ "iroh-tickets",
+ "libc",
+ "notify",
+ "notify-debouncer-full",
+ "rand",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2840,37 +2871,6 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "p2p-dir-sync"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base32",
- "base64",
- "blake3",
- "clap",
- "futures-lite",
- "iroh",
- "iroh-base",
- "iroh-blobs",
- "iroh-gossip",
- "iroh-tickets",
- "libc",
- "notify",
- "notify-debouncer-full",
- "rand",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "papaya"

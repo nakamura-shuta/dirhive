@@ -2,14 +2,14 @@
 description: Show recent incoming change log entries (Upsert / Tombstone) recorded by the daemon
 argument-hint: [limit]
 allowed-tools:
-  - mcp__p2p-dir-sync__sync.list-pending
+  - mcp__dirhive__sync.list-pending
 ---
 
 Parse the optional argument:
 
 - `$1` (optional) = max number of entries to fetch. Default = no truncation.
 
-Call `mcp__p2p-dir-sync__sync.list-pending` with `{limit: $1}` (omit `limit` if no arg).
+Call `mcp__dirhive__sync.list-pending` with `{limit: $1}` (omit `limit` if no arg).
 
 The response shape is `{entries: [PendingEntry...]}`. Each entry is either:
 
@@ -26,4 +26,4 @@ After the list, briefly say:
 
 - An empty list means the daemon has not recorded any incoming change since startup.
 - The log is **per-watched-dir** (= keyed by the BLAKE3 hash of the canonical path). If the user changes `--watch <dir>`, this list resets.
-- For server-side log lines (errors, neighbor up/down, daemon-internal events), use `/p2p-dir-sync:status` → `recent-log` instead.
+- For server-side log lines (errors, neighbor up/down, daemon-internal events), use `/dirhive:status` → `recent-log` instead.

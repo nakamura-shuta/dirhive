@@ -1,0 +1,13 @@
+# jj は .gitignore も尊重するが、 jj 特有 ignore を明示。
+# 中身は .gitignore と意図的に同期させる (= 重複でも OK、 source of truth は両方)。
+/target
+Cargo.lock.bak
+*.bak
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+/scratch/
+*.local.toml

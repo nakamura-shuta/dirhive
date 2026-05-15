@@ -1,10 +1,10 @@
-# p2p-dir-sync 要件定義書
+# dirhive 要件定義書
 
 作成日: 2026-05-14
 
 ## 1. 目的
 
-`p2p-dir-sync` は、任意のローカルディレクトリを P2P で同期するための、シンプルで安全な同期 daemon + MCP plugin である。
+`dirhive` は、任意のローカルディレクトリを P2P で同期するための、シンプルで安全な同期 daemon + MCP plugin である。
 
 主目的は、Syncthing のような高機能な汎用同期ツールを置き換えることではない。AI agent から扱いやすい、最小限で理解しやすい P2P 同期 control plane を提供する。
 
@@ -20,7 +20,7 @@
 - LLM Wiki の情報構造は今後も変わり得る。
 - P2P Sync は LLM Wiki を知らない方が再利用性が高い。
 
-そのため、P2P 同期部分を独立した `p2p-dir-sync` として切り出す。
+そのため、P2P 同期部分を独立した `dirhive` として切り出す。
 
 ## 3. 基本方針
 
@@ -55,7 +55,7 @@
 例:
 
 ```bash
-p2p-dir-sync --watch ~/Documents/notes
+dirhive --watch ~/Documents/notes
 ```
 
 ### 5.2 AI agent からの同期管理
@@ -71,9 +71,9 @@ Claude Code / Codex から次のような操作を行う。
 
 ### 5.3 LLM Wiki からの利用
 
-LLM Wiki は `docs/llm-wiki/` を通常の同期対象ディレクトリとして `p2p-dir-sync` に渡す。
+LLM Wiki は `docs/llm-wiki/` を通常の同期対象ディレクトリとして `dirhive` に渡す。
 
-`p2p-dir-sync` 側は、そのディレクトリが wiki であることを知らない。
+`dirhive` 側は、そのディレクトリが wiki であることを知らない。
 
 ## 6. 機能要件
 
@@ -152,7 +152,7 @@ CRDT は採用しない。
 - 上位アプリケーションが「未確認の同期変更」を表示する。
 - LLM Wiki などが git status と組み合わせて変更要約を作る。
 
-`p2p-dir-sync` は git を知らない。git status との結合は上位レイヤで行う。
+`dirhive` は git を知らない。git status との結合は上位レイヤで行う。
 
 ### 6.7 MCP Server
 
@@ -182,13 +182,13 @@ Claude Code / Codex 向け plugin を提供する。
 
 | command | 目的 |
 |---|---|
-| `/p2p-dir-sync:setup-doctor` | 全体診断 |
-| `/p2p-dir-sync:status` | 同期状態確認 |
-| `/p2p-dir-sync:invite` | ticket 発行 |
-| `/p2p-dir-sync:accept` | ticket accept |
-| `/p2p-dir-sync:peers` | peer 一覧 |
-| `/p2p-dir-sync:revoke` | peer revoke |
-| `/p2p-dir-sync:pending` | 最近の受信変更 |
+| `/dirhive:setup-doctor` | 全体診断 |
+| `/dirhive:status` | 同期状態確認 |
+| `/dirhive:invite` | ticket 発行 |
+| `/dirhive:accept` | ticket accept |
+| `/dirhive:peers` | peer 一覧 |
+| `/dirhive:revoke` | peer revoke |
+| `/dirhive:pending` | 最近の受信変更 |
 
 plugin は使いやすさのための UX layer であり、同期ロジックは持たない。
 
@@ -237,7 +237,7 @@ Linux / Windows は初期 scope 外。ただし、設計上は systemd / Windows
 例:
 
 ```bash
-p2p-dir-sync --watch /Users/me/Documents/notes
+dirhive --watch /Users/me/Documents/notes
 ```
 
 将来的に設定ファイルを導入する場合は以下のような構造を想定する。
@@ -260,11 +260,11 @@ Claude Code / Codex
   |
   | MCP stdio
   v
-p2p-dir-sync-mcp
+dirhive-mcp
   |
   | Unix socket JSON-RPC
   v
-p2p-dir-sync daemon
+dirhive daemon
   |
   | Iroh gossip / blobs
   v
@@ -289,23 +289,23 @@ iroh:
 
 ## 10. LLM Wiki との関係
 
-`p2p-dir-sync` は LLM Wiki の下位 backend として使える。
+`dirhive` は LLM Wiki の下位 backend として使える。
 
 ただし、以下を守る。
 
-- `p2p-dir-sync` は LLM Wiki を知らない。
-- `p2p-dir-sync` は wiki schema を読まない。
-- `p2p-dir-sync` は `entity-registry.json` を特別扱いしない。
+- `dirhive` は LLM Wiki を知らない。
+- `dirhive` は wiki schema を読まない。
+- `dirhive` は `entity-registry.json` を特別扱いしない。
 - LLM Wiki 側が必要なら、`sync.list-pending` を MCP / JSON-RPC 経由で呼ぶ。
 
-つまり、LLM Wiki は `p2p-dir-sync` の利用例の 1 つである。
+つまり、LLM Wiki は `dirhive` の利用例の 1 つである。
 
 ## 11. MVP Scope
 
 MVP で作るもの:
 
-- Rust daemon binary `p2p-dir-sync`
-- MCP server binary `p2p-dir-sync-mcp`
+- Rust daemon binary `dirhive`
+- MCP server binary `dirhive-mcp`
 - 1 directory watch
 - upsert sync
 - tombstone sync
@@ -353,7 +353,7 @@ MVP で作らないもの:
 | Q2 | 複数 folder を初期実装するか | しない |
 | Q3 | Syncthing wrapper にするか独自実装にするか | 独自実装 |
 | Q4 | CRDT を採用するか | しない |
-| Q5 | plugin 名 | `p2p-dir-sync` |
+| Q5 | plugin 名 | `dirhive` |
 | Q6 | 初期対象 OS | macOS |
 
 ## 14. 受け入れ基準
@@ -362,7 +362,7 @@ MVP で作らないもの:
 - `cargo test` が通る。
 - 2 peer で file create / update / delete が同期される。
 - 3 peer e2e で upsert / tombstone / rename / conflict が確認できる。
-- `/p2p-dir-sync:setup-doctor` が daemon / MCP / watched dir / peer / log を診断できる。
+- `/dirhive:setup-doctor` が daemon / MCP / watched dir / peer / log を診断できる。
 - LLM Wiki を知らないディレクトリでも同期できる。
 - `docs/llm-wiki/` を watch 対象にした場合も、通常ディレクトリとして同期できる。
 
@@ -383,7 +383,7 @@ MVP で作らないもの:
 
 ## 16. 設計上の結論
 
-`p2p-dir-sync` は、AI agent が安全に扱える P2P directory sync control plane として設計する。
+`dirhive` は、AI agent が安全に扱える P2P directory sync control plane として設計する。
 
 LLM Wiki は主用途の 1 つだが、実装上の依存や知識は持たせない。
 

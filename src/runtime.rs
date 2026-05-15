@@ -39,9 +39,9 @@ use crate::allowlist::AllowList;
 use crate::allowlist_blobs::{AllowlistBlobs, BlobServeCallback};
 
 /// `derive_topic_id` で使う固定 prefix (= protocol versioning + domain separation)。
-/// `\0` までを 1 つの byte string 扱いするので `b"p2p-dir-sync/v1/topic\0"` を
+/// `\0` までを 1 つの byte string 扱いするので `b"dirhive/v1/topic\0"` を
 /// そのまま hash input にする。
-pub const TOPIC_DOMAIN: &[u8] = b"p2p-dir-sync/v1/topic\0";
+pub const TOPIC_DOMAIN: &[u8] = b"dirhive/v1/topic\0";
 
 /// folder_secret から TopicId を導出する (= design.md §4.3)。
 ///
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn topic_domain_is_versioned() {
-        assert_eq!(TOPIC_DOMAIN, b"p2p-dir-sync/v1/topic\0");
+        assert_eq!(TOPIC_DOMAIN, b"dirhive/v1/topic\0");
     }
 
     #[test]
@@ -251,7 +251,7 @@ mod tests {
         let secret = [0xABu8; 16];
         let expected = {
             let mut h = blake3::Hasher::new();
-            h.update(b"p2p-dir-sync/v1/topic\0");
+            h.update(b"dirhive/v1/topic\0");
             h.update(&secret);
             *h.finalize().as_bytes()
         };
@@ -263,8 +263,8 @@ mod tests {
     fn topic_domain_byte_layout() {
         // 改ざんによる silent topic-id 変化を防ぐため、 prefix の bytes を
         // 直接 assert する (= 「`v1/`」を消す PR を CI で落とす役割)。
-        let bytes = b"p2p-dir-sync/v1/topic\0";
-        assert_eq!(bytes.len(), 22);
+        let bytes = b"dirhive/v1/topic\0";
+        assert_eq!(bytes.len(), 17);
         assert_eq!(bytes[bytes.len() - 1], 0);
         assert!(bytes.windows(3).any(|w| w == b"v1/"));
     }

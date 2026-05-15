@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub const SYNC_UPDATE_VERSION: u32 = 2;
 
 /// `InviteTicket` envelope の prefix。
-pub const INVITE_PREFIX: &str = "p2psync1-";
+pub const INVITE_PREFIX: &str = "dirhive1-";
 
 /// gossip 上で流す change message。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,7 +123,7 @@ pub fn validate_relative_path(p: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// InviteTicket: EndpointTicket + folder_secret 16 bytes を `p2psync1-<base32>`
+// InviteTicket: EndpointTicket + folder_secret 16 bytes を `dirhive1-<base32>`
 // envelope で wrap する。base32 (RFC 4648、no-pad) = case-insensitive で QR /
 // messenger 経路で読み間違いが起きにくい (design.md §4.2)。
 // ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ impl InviteTicket {
         Self { endpoint, folder_secret }
     }
 
-    /// `p2psync1-<base32>` envelope に encode。
+    /// `dirhive1-<base32>` envelope に encode。
     pub fn encode(&self) -> Result<String> {
         let json = InviteTicketJson {
             endpoint_ticket: Ticket::encode_string(&self.endpoint),
@@ -163,7 +163,7 @@ impl InviteTicket {
         ))
     }
 
-    /// `p2psync1-<base32>` envelope から decode。base32 は case-insensitive
+    /// `dirhive1-<base32>` envelope から decode。base32 は case-insensitive
     /// (= RFC 4648 §6 の "decoders SHOULD accept lower-case" を実現するため、
     /// payload を upper-case 化してから decode する)。
     pub fn decode(s: &str) -> Result<Self> {
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn invite_ticket_rejects_invalid_base32() {
         // `!` は base32 RFC 4648 alphabet 外 (= A-Z + 2-7 のみ)
-        let e = InviteTicket::decode("p2psync1-!!!!!").unwrap_err();
+        let e = InviteTicket::decode("dirhive1-!!!!!").unwrap_err();
         assert!(format!("{e}").contains("base32"));
     }
 

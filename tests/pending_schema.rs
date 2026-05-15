@@ -2,7 +2,7 @@
 //! `PendingEntry` enum で deserialize できることを確認する drift 防止 test。
 //! design.md §11 acceptance gate (Phase 2 完了条件)。
 
-use p2p_dir_sync::pending_log::PendingEntry;
+use dirhive::pending_log::PendingEntry;
 
 const UPSERT_FIXTURE: &str = include_str!("../docs/schema/pending-entry.v1.upsert.json");
 const TOMBSTONE_FIXTURE: &str = include_str!("../docs/schema/pending-entry.v1.tombstone.json");

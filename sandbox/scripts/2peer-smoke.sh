@@ -50,8 +50,8 @@ test -f "${RPC_PY}"
 
 # --- setup tmp HOMEs ------------------------------------------------------
 # AF_UNIX sun_path 104 byte 上限を避けるため `/tmp/...` 直下。
-ALICE_HOME=$(mktemp -d /tmp/p2p-alice.XXXXXX)
-BOB_HOME=$(mktemp -d /tmp/p2p-bob.XXXXXX)
+ALICE_HOME=$(mktemp -d /tmp/dirhive-alice.XXXXXX)
+BOB_HOME=$(mktemp -d /tmp/dirhive-bob.XXXXXX)
 mkdir -p "${ALICE_HOME}/watched" "${BOB_HOME}/watched"
 ORIG_HOME="${HOME}"
 
@@ -92,11 +92,11 @@ spawn_daemon() {
     PATH="${home}/.local/bin:${MIN_PATH}" \
     TMPDIR=/tmp \
     TERM="${TERM:-xterm-256color}" \
-    P2P_SYNC_LOG="info,p2p_dir_sync=debug" \
-    "${home}/.local/bin/p2p-sync" --watch "${home}/watched" \
+    DIRHIVE_LOG="info,dirhive=debug" \
+    "${home}/.local/bin/dirhive" --watch "${home}/watched" \
     >"${log}.stdout" 2>"${log}.stderr" &
   SPAWN_PID=$!
-  local sock="${home}/.local/share/p2p-dir-sync/daemon.sock"
+  local sock="${home}/.local/share/dirhive/daemon.sock"
   for _ in $(seq 1 60); do
     if [[ -S "${sock}" ]] && \
         python3 "${RPC_PY}" "${sock}" sync.health-check >/dev/null 2>&1; then
@@ -135,8 +135,8 @@ wait_for_file() {
 }
 
 # `${home}` の daemon socket に対して RPC 投げる。 result JSON を stdout に。
-rpc_alice() { python3 "${RPC_PY}" "${ALICE_HOME}/.local/share/p2p-dir-sync/daemon.sock" "$@"; }
-rpc_bob()   { python3 "${RPC_PY}" "${BOB_HOME}/.local/share/p2p-dir-sync/daemon.sock"   "$@"; }
+rpc_alice() { python3 "${RPC_PY}" "${ALICE_HOME}/.local/share/dirhive/daemon.sock" "$@"; }
+rpc_bob()   { python3 "${RPC_PY}" "${BOB_HOME}/.local/share/dirhive/daemon.sock"   "$@"; }
 
 # JSON value 抽出 (= jq 無し env 向け)
 json_field() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
@@ -149,13 +149,13 @@ else
   tail -30 "${ALICE_HOME}/install.log"
   fail_msg "install.sh failed for alice"
 fi
-test -x "${ALICE_HOME}/.local/bin/p2p-sync"
-test -x "${ALICE_HOME}/.local/bin/p2p-sync-mcp"
+test -x "${ALICE_HOME}/.local/bin/dirhive"
+test -x "${ALICE_HOME}/.local/bin/dirhive-mcp"
 
 section "0b. copy binaries to bob HOME (cargo build skip)"
 mkdir -p "${BOB_HOME}/.local/bin"
-cp -f "${ALICE_HOME}/.local/bin/p2p-sync"     "${BOB_HOME}/.local/bin/"
-cp -f "${ALICE_HOME}/.local/bin/p2p-sync-mcp" "${BOB_HOME}/.local/bin/"
+cp -f "${ALICE_HOME}/.local/bin/dirhive"     "${BOB_HOME}/.local/bin/"
+cp -f "${ALICE_HOME}/.local/bin/dirhive-mcp" "${BOB_HOME}/.local/bin/"
 chmod 0755 "${BOB_HOME}/.local/bin/"*
 ok "binaries copied to ${BOB_HOME}/.local/bin/"
 
@@ -168,7 +168,7 @@ ok "alice daemon PID=${ALICE_PID}"
 invite_resp=$(rpc_alice sync.invite)
 TICKET=$(echo "${invite_resp}" | json_field ticket)
 restart=$(echo "${invite_resp}" | json_field restart_required)
-[[ "${TICKET}" == p2psync1-* ]] || fail_msg "ticket prefix wrong: ${TICKET:0:30}..."
+[[ "${TICKET}" == dirhive1-* ]] || fail_msg "ticket prefix wrong: ${TICKET:0:30}..."
 [[ "${restart}" == "True" ]] || fail_msg "restart_required != True: ${restart}"
 ok "got ticket (${#TICKET} chars)"
 

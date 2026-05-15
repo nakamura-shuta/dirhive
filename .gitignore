@@ -2,3 +2,15 @@
 Cargo.lock.bak
 *.bak
 .DS_Store
+
+# editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# local scratch / test residue (= smoke が `/tmp/dirhive-*` を作るので repo root に
+# 残るケースは無いが念のため)
+/scratch/
+*.local.toml

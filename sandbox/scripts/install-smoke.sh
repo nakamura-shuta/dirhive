@@ -37,9 +37,9 @@ test -d "${PLUGIN_DIR}/.claude-plugin"
 # --- setup tmp HOME -------------------------------------------------------
 # AF_UNIX の sun_path 上限 (= macOS 104 byte) があるので tmp HOME を **短い path**
 # (`/tmp/...`) に切る。 macOS の `mktemp -t` は `/var/folders/...` を返すので
-# socket path (= `${HOME}/.local/share/p2p-dir-sync/daemon.sock`) が 100 byte 超え
+# socket path (= `${HOME}/.local/share/dirhive/daemon.sock`) が 100 byte 超え
 # になり `bind` が失敗する。 `/tmp` ベースなら ~80 byte に収まる。
-TMPHOME=$(mktemp -d /tmp/p2p-sync-smoke.XXXXXX)
+TMPHOME=$(mktemp -d /tmp/dirhive-smoke.XXXXXX)
 ORIG_HOME="${HOME}"
 WATCH_DIR="${TMPHOME}/watched"
 mkdir -p "${WATCH_DIR}"
@@ -66,7 +66,7 @@ install_env() {
 }
 
 # step 3 専用: CARGO_BIN_DIR を含まない pure minimal PATH。
-# 旧 install_env は ~/.cargo/bin 等を含むので、 そこに古い p2p-sync が残っている
+# 旧 install_env は ~/.cargo/bin 等を含むので、 そこに古い dirhive が残っている
 # user 環境では verify.sh が「 PATH 経由で binary 発見 」 してしまい step 3 の
 # 「 PATH 未追加で fail する 」 確認が誤って通る。 step 3 は cargo 不要なので、
 # CARGO_BIN_DIR を入れない version で隔離する。
@@ -121,7 +121,7 @@ fi
 
 # --- 2. binary 配置 --------------------------------------------------------
 section "2. binaries at \$HOME/.local/bin"
-for bin in p2p-sync p2p-sync-mcp; do
+for bin in dirhive dirhive-mcp; do
   if [[ -x "${TMPHOME}/.local/bin/${bin}" ]]; then
     ok "${TMPHOME}/.local/bin/${bin}"
   else
@@ -132,7 +132,7 @@ done
 # --- 3. PATH 未追加で verify.sh が「 binary が PATH 上に無い 」 で fail する -----
 section "3. verify.sh fails when PATH does not include ~/.local/bin"
 # minimal_env (= CARGO_BIN_DIR 含まない) で起動する。 旧 install_env だと
-# ~/.cargo/bin に古い p2p-sync が残っている user 環境で verify.sh が誤って通る。
+# ~/.cargo/bin に古い dirhive が残っている user 環境で verify.sh が誤って通る。
 if minimal_env "${PLUGIN_DIR}/verify.sh" >"${TMPHOME}/verify-bare.log" 2>&1; then
   fail_msg "verify.sh should FAIL when ~/.local/bin is not on PATH, but it passed"
 else
@@ -168,7 +168,7 @@ else
 fi
 
 # --- 6. daemon を起動 ------------------------------------------------------
-section "6. spawn p2p-sync daemon (--watch ${WATCH_DIR})"
+section "6. spawn dirhive daemon (--watch ${WATCH_DIR})"
 # **bash function + `&` は使わない**: `func &` は subshell を介して関数を呼ぶため
 # `$!` が subshell PID になり、 後の `kill $DAEMON_PID` が daemon ではなく
 # subshell を SIGTERM する → daemon が orphan + exit 143 観測。 `env -i` を直接
@@ -178,11 +178,11 @@ env -i \
   PATH="${TMPHOME}/.local/bin:${MIN_PATH}" \
   TMPDIR=/tmp \
   TERM="${TERM:-xterm-256color}" \
-  "${TMPHOME}/.local/bin/p2p-sync" --watch "${WATCH_DIR}" \
+  "${TMPHOME}/.local/bin/dirhive" --watch "${WATCH_DIR}" \
   >"${TMPHOME}/daemon.stdout" 2>"${TMPHOME}/daemon.stderr" &
 DAEMON_PID=$!
 
-SOCK="${TMPHOME}/.local/share/p2p-dir-sync/daemon.sock"
+SOCK="${TMPHOME}/.local/share/dirhive/daemon.sock"
 # socket 出現 + RPC 応答まで待つ (= max 30s polling)
 ready=0
 for _ in $(seq 1 60); do
@@ -216,8 +216,8 @@ fi
 ok "daemon socket ready at ${SOCK}"
 
 # --- 7. MCP probe (stdio handshake + sync.ping + sync.health-check) --------
-section "7. MCP probe (p2p-sync-mcp stdio)"
-if user_env python3 "${SCRIPT_DIR}/lib/mcp_probe.py" "${TMPHOME}/.local/bin/p2p-sync-mcp"; then
+section "7. MCP probe (dirhive-mcp stdio)"
+if user_env python3 "${SCRIPT_DIR}/lib/mcp_probe.py" "${TMPHOME}/.local/bin/dirhive-mcp"; then
   ok "MCP probe passed"
 else
   echo "--- daemon.stderr tail ---"
