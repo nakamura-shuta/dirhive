@@ -1,6 +1,8 @@
 {
   "name": "p2p-dir-sync",
-  "owner": "p2p-dir-sync",
+  "owner": {
+    "name": "p2p-dir-sync"
+  },
   "metadata": {
     "description": "P2P directory sync between trusted peers, with bilateral invite flow.",
     "version": "0.1.0"
@@ -8,7 +10,7 @@
   "plugins": [
     {
       "name": "p2p-dir-sync",
-      "source": ".",
+      "source": "./",
       "description": "Sync a watched directory with peers over Iroh P2P",
       "keywords": [
         "p2p",

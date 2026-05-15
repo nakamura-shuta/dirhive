@@ -69,6 +69,17 @@ if [[ -z "${mcp_cmd}" ]]; then
   fail=1
 elif command -v "${mcp_cmd}" >/dev/null 2>&1; then
   grn "    ✓ ${mcp_cmd} ($(command -v "${mcp_cmd}"))"
+  case "${mcp_cmd}" in
+    /*)
+      grn "      (absolute path; safe for GUI / launchd / non-shell MCP host)"
+      ;;
+    *)
+      yel "    ⚠ ${mcp_cmd} is relative; resolution depends on \$PATH in the MCP host"
+      yel "      Some hosts (Claude Code GUI / launchd) have a minimal \$PATH."
+      yel "      Consider replacing it with an absolute path in .mcp.json:"
+      yel "        \"command\": \"${HOME}/.local/bin/${mcp_cmd}\""
+      ;;
+  esac
 else
   red "    ✗ ${mcp_cmd} (declared in .mcp.json but not on PATH)"
   fail=1
@@ -92,6 +103,30 @@ if [[ -S "${SOCK}" ]]; then
   fi
 else
   yel "    ⚠ ${SOCK} not present yet (daemon not started?)"
+fi
+
+echo
+echo "==> 5. claude plugin validate (= Claude Code schema)"
+# `claude plugin validate <dir>` reads .claude-plugin/marketplace.json. If only
+# .claude-plugin/plugin.json is present, point validate at it directly.
+if command -v claude >/dev/null 2>&1; then
+  if claude plugin validate "${PLUGIN_DIR}/.claude-plugin/plugin.json" >/dev/null 2>&1; then
+    grn "    ✓ plugin.json schema valid"
+  else
+    red "    ✗ plugin.json schema invalid:"
+    claude plugin validate "${PLUGIN_DIR}/.claude-plugin/plugin.json" 2>&1 | sed 's/^/      /' || true
+    fail=1
+  fi
+  if claude plugin validate "${PLUGIN_DIR}" >/dev/null 2>&1; then
+    grn "    ✓ marketplace.json schema valid"
+  else
+    red "    ✗ marketplace.json schema invalid:"
+    claude plugin validate "${PLUGIN_DIR}" 2>&1 | sed 's/^/      /' || true
+    fail=1
+  fi
+else
+  yel "    ⚠ claude CLI not on PATH; skipping plugin schema validation"
+  yel "      (install Claude Code to enable this check)"
 fi
 
 echo

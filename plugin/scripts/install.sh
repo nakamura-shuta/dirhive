@@ -77,4 +77,16 @@ Next steps:
 
 3. From the agent, run /p2p-dir-sync:setup-doctor to verify everything is wired.
 
+4. (Optional) Pin the MCP command to an absolute path.
+
+   The staged .mcp.json declares `"command": "p2p-sync-mcp"`, which relies on
+   the MCP host's \$PATH. Some hosts (Claude Code GUI / launchd) start with a
+   minimal \$PATH and may fail to find it. If you hit this, edit
+   ${PLUGIN_DIR}/.mcp.json and set:
+
+       "command": "${BIN_DIR}/p2p-sync-mcp"
+
+   ./verify.sh prints a warning when the command is relative; this is benign in
+   shell contexts but worth pinning for GUI launches.
+
 EOF
