@@ -63,18 +63,16 @@ if [[ ! -x "${BIN_PATH}" ]]; then
   exit 2
 fi
 
-# --- substitute -----------------------------------------------------------
+# --- render plist via plistlib (= Phase 5 review H1 fix) ------------------
+# 旧 logic は sed で `__BIN__` / `__WATCH__` / `__HOME__` を置換していたが、
+# path 中に `&` があると sed の "match 全体" 展開で `__WATCH__` のまま消えるし、
+# XML 特殊文字 (`<`, `>`, `&`, `"`) で plist が壊れる。 Python の plistlib に
+# 任せて escape を自動化する。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEMPLATE="${SCRIPT_DIR}/com.user.p2p-dir-sync.plist.template"
-test -f "${TEMPLATE}"
+RENDER_PY="${SCRIPT_DIR}/lib/render-plist.py"
+test -f "${RENDER_PY}"
 
-PLIST_BODY=$(
-  sed \
-    -e "s|__BIN__|${BIN_PATH}|g" \
-    -e "s|__WATCH__|${WATCH_ABS}|g" \
-    -e "s|__HOME__|${HOME}|g" \
-    "${TEMPLATE}"
-)
+PLIST_BODY=$(python3 "${RENDER_PY}" "${HOME}" "${BIN_PATH}" "${WATCH_ABS}")
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
   echo "==> rendered plist (dry-run):"
