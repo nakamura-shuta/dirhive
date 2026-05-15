@@ -6,17 +6,19 @@
 //! 2. watched_dir canonicalize
 //! 3. paths 解決 + log file 用 dir 用意
 //! 4. tracing 初期化 (= stderr + log file の両方に出力、 M3)
-//! 5. **早期** daemon_lock 取得 + stale socket recover (= M4: Iroh bind より前)
-//! 6. endpoint.key load / generate
-//! 7. folder_secret lazy load
-//! 8. Endpoint::bind + online
-//! 9. blobs_dir 0o700 prepare
-//! 10. allowlist load (file 不在 → strict empty、 --allow-open-all で open_all)
-//! 11. SyncRuntime::build
-//! 12. DaemonState 構築
-//! 13. listener spawn (`bind_listener_with_lock` で early lock を pass-through)
-//! 14. (Phase 3 後半で wire) watcher + receive_loop
-//! 15. SIGINT / SIGTERM 待機 → graceful shutdown
+//! 5. **最早期 signal handler install** (= setup 中の SIGTERM を buffer して
+//!    setup 完了後に graceful shutdown を発火する)
+//! 6. 早期 daemon_lock 取得 + stale socket recover (= M4: Iroh bind より前)
+//! 7. endpoint.key load / generate
+//! 8. folder_secret lazy load
+//! 9. Endpoint::bind + online
+//! 10. blobs_dir 0o700 prepare
+//! 11. allowlist load (file 不在 → strict empty、 --allow-open-all で open_all)
+//! 12. SyncRuntime::build
+//! 13. DaemonState 構築
+//! 14. listener spawn (`bind_listener_with_lock` で early lock を pass-through)
+//! 15. watcher + receive_loop spawn
+//! 16. SIGINT / SIGTERM 待機 (= 既 install 済 stream) → graceful shutdown
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -71,6 +73,21 @@ async fn main() -> Result<()> {
 
     // (4) tracing 初期化 (stderr + log file、 sync.recent-log が tail する file)
     init_tracing(&daemon_paths.log_path)?;
+
+    // (5) **最早期** に signal handler を install する。
+    // tokio の signal stream は install 時点から signal を buffer する仕様。
+    // ここで stream を取得しておき、 setup (endpoint.bind / online / etc.) の
+    // 数百ms〜1s で SIGTERM / SIGINT が来ても buffer されて、 最後の select! で
+    // 取り出される → graceful shutdown が走る。 launchd 経由で daemon 起動直後に
+    // SIGTERM が来るような edge case でも socket を残さない。
+    let mut int_stream = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::interrupt(),
+    )
+    .context("install SIGINT handler")?;
+    let mut term_stream = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )
+    .context("install SIGTERM handler")?;
 
     if cli.allow_open_all {
         tracing::warn!(
@@ -430,8 +447,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    // (15) SIGINT / SIGTERM 待機 → graceful shutdown
-    wait_for_shutdown_signal().await?;
+    // (16) signal 待機 (= setup 中に届いた signal は既に stream に buffer されている
+    // ので、 recv() がすぐ return する可能性あり)
+    tokio::select! {
+        _ = int_stream.recv() => tracing::debug!("got SIGINT"),
+        _ = term_stream.recv() => tracing::debug!("got SIGTERM"),
+    }
     tracing::info!("shutdown signal received");
     listener_handle.shutdown().await.context("listener shutdown")?;
     // bg_tasks (watcher / receive_loop) は abort して exit を急ぐ。
@@ -520,13 +541,3 @@ impl Write for SharedFileGuard<'_> {
     }
 }
 
-async fn wait_for_shutdown_signal() -> Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut int_stream = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
-    let mut term_stream = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
-    tokio::select! {
-        _ = int_stream.recv() => tracing::debug!("got SIGINT"),
-        _ = term_stream.recv() => tracing::debug!("got SIGTERM"),
-    }
-    Ok(())
-}
