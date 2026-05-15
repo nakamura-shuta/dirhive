@@ -277,9 +277,9 @@ python3 ... rpc.py "$SOCK" sync.recent-log '{"lines": 100}'   # daemon 動いて
 
 `compute_conflict_backup_path` の動作。 受信 file が local 既存と異なる内容のとき、 **既存 local を backup file に rename して受信内容で上書き** する。 これは「 並行編集で local 変更が失われないように 」 の防御策。
 
-backup file の中身を確認したら、 元 file と手動 merge して 1 本に戻し、 backup file は削除する。
+backup file は **watcher の skip filter に入っている** (= `src/watcher.rs` の `path_is_skippable` が name 中に `.conflict-local-` を含む path を skip)。 そのため backup 自体は peer へ broadcast されず、 local 退避物として留まる。
 
-⚠ **backup file は watcher の skip filter に入っていない** (= 現状 dotfile / `*.swp` / `*.swx` / `*.tmp` / `~` 末尾だけ skip)。 そのまま放置すると watcher が普通の rename event として拾い、 **peer にも `*.conflict-local-*` という名前の file が broadcast されうる**。 mesh 中で重複させたくなければ、 各 peer で削除しておく。
+backup file の中身を確認したら、 元 file と手動 merge して 1 本に戻し、 backup file は削除する (= 放置しても害はないが、 混乱防止のため掃除推奨)。
 
 ### 5.6 「 daemon が高頻度で restart している (= crash loop) 」
 

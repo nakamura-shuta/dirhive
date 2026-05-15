@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "P2P directory sync daemon + MCP server (= small-circle bilateral invite mesh)"
 license = "MIT"
+repository = "https://github.com/nakamura-shuta/dirhive"
+homepage = "https://github.com/nakamura-shuta/dirhive"
 
 # ------------------------------------------------------------------------
 # Iroh 系 crate のバージョン対応表 (2026-05-14 時点で 1.0 rc が出揃ったので
