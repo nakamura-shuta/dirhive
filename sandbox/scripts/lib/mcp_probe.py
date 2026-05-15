@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import subprocess
 import sys
 from typing import Any
 
 
 PROTOCOL_VERSION = "2024-11-05"
+# Per-recv timeout. MCP server が initialize / tools/list に応答せず止まると
+# CI / smoke が無限 hang する (= 旧版 readline() に timeout なし) ので、 各
+# recv() に 20s の deadline を入れる。
+RECV_TIMEOUT_SECS = 20.0
 
 
 def main(argv: list[str]) -> int:
@@ -52,6 +57,14 @@ def main(argv: list[str]) -> int:
 
     def recv() -> dict[str, Any]:
         assert proc.stdout is not None
+        # readline() に組み込み timeout が無いので select.select で fd を監視。
+        # `RECV_TIMEOUT_SECS` 内に 1 行揃わない (= EOF も含む) なら error にする。
+        fd = proc.stdout.fileno()
+        ready, _, _ = select.select([fd], [], [], RECV_TIMEOUT_SECS)
+        if not ready:
+            raise RuntimeError(
+                f"MCP server did not respond within {RECV_TIMEOUT_SECS}s"
+            )
         line = proc.stdout.readline()
         if not line:
             raise RuntimeError("MCP server closed stdout before responding")

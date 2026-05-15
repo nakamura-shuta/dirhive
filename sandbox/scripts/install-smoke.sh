@@ -65,6 +65,20 @@ install_env() {
     "$@"
 }
 
+# step 3 専用: CARGO_BIN_DIR を含まない pure minimal PATH。
+# 旧 install_env は ~/.cargo/bin 等を含むので、 そこに古い p2p-sync が残っている
+# user 環境では verify.sh が「 PATH 経由で binary 発見 」 してしまい step 3 の
+# 「 PATH 未追加で fail する 」 確認が誤って通る。 step 3 は cargo 不要なので、
+# CARGO_BIN_DIR を入れない version で隔離する。
+minimal_env() {
+  env -i \
+    HOME="${TMPHOME}" \
+    PATH="${MIN_PATH}" \
+    TMPDIR=/tmp \
+    TERM="${TERM:-xterm-256color}" \
+    "$@"
+}
+
 # user PATH に ~/.local/bin を追加した状態 (= install 後)
 user_env() {
   env -i \
@@ -117,7 +131,9 @@ done
 
 # --- 3. PATH 未追加で verify.sh が「 binary が PATH 上に無い 」 で fail する -----
 section "3. verify.sh fails when PATH does not include ~/.local/bin"
-if install_env "${PLUGIN_DIR}/verify.sh" >"${TMPHOME}/verify-bare.log" 2>&1; then
+# minimal_env (= CARGO_BIN_DIR 含まない) で起動する。 旧 install_env だと
+# ~/.cargo/bin に古い p2p-sync が残っている user 環境で verify.sh が誤って通る。
+if minimal_env "${PLUGIN_DIR}/verify.sh" >"${TMPHOME}/verify-bare.log" 2>&1; then
   fail_msg "verify.sh should FAIL when ~/.local/bin is not on PATH, but it passed"
 else
   ok "verify.sh correctly exited non-zero"
@@ -218,12 +234,18 @@ kill "${DAEMON_PID}"
 daemon_exit=0
 wait "${DAEMON_PID}" || daemon_exit=$?
 DAEMON_PID=""
+# graceful shutdown / socket cleanup の regression を **fail** で検出する
+# (= 旧 warn 扱いだと SIGTERM race の re-introduction が smoke で見逃される)。
 if [[ ${daemon_exit} -eq 0 ]]; then
   ok "daemon exited 0 (graceful shutdown)"
-elif [[ ${daemon_exit} -eq 143 ]]; then
-  warn "daemon exited 143 (= SIGTERM without handler installation; race window?)"
 else
-  warn "daemon exited ${daemon_exit}"
+  echo "    daemon.stderr tail:"
+  tail -10 "${TMPHOME}/daemon.stderr" 2>/dev/null | sed 's/^/      /'
+  if [[ ${daemon_exit} -eq 143 ]]; then
+    fail_msg "daemon exited 143 (= SIGTERM without handler; signal install regressed?)"
+  else
+    fail_msg "daemon exited ${daemon_exit} (= non-graceful)"
+  fi
 fi
 # socket unlink は graceful shutdown 内の Drop で行われる。 一部 OS では
 # `wait` 戻り時点で fs entry がまだ propagate していないことがあるので、 短い
@@ -235,9 +257,11 @@ done
 if [[ ! -S "${SOCK}" ]]; then
   ok "socket cleaned up on shutdown"
 else
-  warn "socket still present at ${SOCK} (= graceful unlink may have failed)"
+  # graceful shutdown 後に socket が残るのは Drop 内 unlink の regression。
+  # warn ではなく fail にして smoke で検出する。
   echo "    daemon.stderr tail:"
   tail -10 "${TMPHOME}/daemon.stderr" | sed 's/^/      /'
+  fail_msg "socket still present at ${SOCK} (= Drop unlink failed?)"
 fi
 
 printf '\n\033[32m✅ install-smoke: ALL CHECKS PASSED\033[0m\n'
