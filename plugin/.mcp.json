@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "p2p-dir-sync": {
+      "command": "p2p-sync-mcp",
+      "args": [],
+      "env": {
+        "P2P_SYNC_LOG": "info"
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "p2p-dir-sync",
+  "version": "0.1.0",
+  "description": "P2P directory sync daemon + MCP server. Bilateral invite-based file sync over Iroh.",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "p2p-dir-sync"
+  }
+}
