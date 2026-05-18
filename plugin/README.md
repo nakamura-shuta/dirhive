@@ -1,5 +1,12 @@
 # dirhive plugin
 
+**Optional integration. MCP-only users do not need this plugin.** dirhive MCP
+server だけなら repo root `README.md` の `claude mcp add` で十分。 この plugin
+を入れるのは:
+
+- `/dirhive:*` slash command で 7-step bilateral invite を walk-through したい場合
+- `SKILL.md` 経由で AI agent に手順遵守を促したい場合
+
 Claude Code / Codex plugin that wraps the `dirhive` daemon and the `dirhive-mcp`
 MCP server. Lets an AI agent run the canonical 7-step bilateral invite flow and
 inspect the daemon state without leaving the chat.

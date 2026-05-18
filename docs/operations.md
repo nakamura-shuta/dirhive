@@ -1,9 +1,11 @@
-# operations.md — dirhive 運用手順
+# operations.md — dirhive 詳細 reference
 
-`dirhive` daemon を実機で長期運用するときの手順集。 **新規 user の install から、 launchd 常駐、 invite/accept、 トラブルシュート、 復旧、 uninstall まで** をこの 1 doc にまとめる。
+> **まず動かすには** repo root の [`README.md`](../README.md) を見るのが早い (= Install → Start the daemon → Connect Claude Code → Quickstart の順)。 ここは「**動かしてから先**」 の話を集めた詳細 reference。
+
+dirhive daemon を実機で長期運用するときの手順集。 launchd 常駐、 invite/accept の MCP/slash/直接 RPC 各経路、 トラブルシュート、 復旧、 uninstall をまとめている。
 
 設計の詳細 (= なぜそうなっているか) は [`design.md`](./design.md) を参照。
-AI agent 経由の操作は [`../plugin/README.md`](../plugin/README.md) を参照。
+plugin / slash command 経由の操作は [`../plugin/README.md`](../plugin/README.md) を参照。
 
 ---
 
