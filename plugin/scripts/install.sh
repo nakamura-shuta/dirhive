@@ -61,13 +61,18 @@ Next steps:
 
 1. Start the daemon (foreground for the first run):
 
+     mkdir -p ~/notes
      dirhive --watch ~/notes
 
-   For background / auto-start on macOS, drop a launchd plist into
-   ~/Library/LaunchAgents/com.user.dirhive.plist. A reference plist is in
-   docs/design.md §5.4.
+2. Connect Claude Code (= register the MCP server at user scope):
 
-2. Wire the plugin into your AI agent of choice:
+     claude mcp add --scope user --transport stdio dirhive \\
+       -- ${BIN_DIR}/dirhive-mcp
+
+   Then in chat: ask Claude to "sync.ping を呼んで" — you should see "pong".
+
+3. (Optional) Install the plugin for /dirhive:* slash commands + SKILL.md
+   guidance. MCP-only users do not need this.
 
      # Claude Code
      /plugin install ${PLUGIN_DIR}
@@ -75,18 +80,16 @@ Next steps:
      # Codex / others
      point them at ${PLUGIN_DIR}/.codex-plugin/plugin.json
 
-3. From the agent, run /dirhive:setup-doctor to verify everything is wired.
+4. (Optional) Background daemon via launchd:
 
-4. (Optional) Pin the MCP command to an absolute path.
+     ./sandbox/scripts/launchd/install-launchd.sh --watch ~/notes
 
-   The staged .mcp.json declares `"command": "dirhive-mcp"`, which relies on
-   the MCP host's \$PATH. Some hosts (Claude Code GUI / launchd) start with a
-   minimal \$PATH and may fail to find it. If you hit this, edit
-   ${PLUGIN_DIR}/.mcp.json and set:
+5. (Optional) If Claude Code GUI cannot find dirhive-mcp at boot, pin the
+   command's absolute path in ${PLUGIN_DIR}/.mcp.json:
 
        "command": "${BIN_DIR}/dirhive-mcp"
 
-   ./verify.sh prints a warning when the command is relative; this is benign in
-   shell contexts but worth pinning for GUI launches.
+   ./verify.sh warns when the command is relative; benign in shell, but
+   worth pinning for GUI launches.
 
 EOF
